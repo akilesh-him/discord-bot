@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from flask import Flask
 
 # Reads DISCORD_TOKEN, LINK_PASSWORD, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CF_PAGES_PROJECT,
-# SURGE_TOKEN, SURGE_LOGIN
+# SURGE_TOKEN, SURGE_LOGIN, VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
 # from the .env next to this file. Render has no .env, so it uses its own env vars.
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
@@ -509,9 +509,53 @@ async def deploy_surge_site() -> str:
 
     return f"https://{domain}"
 
+VERCEL_BIN = BASE_DIR / "node_modules" / ".bin" / "vercel"
+VERCEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.vercel\.app")
+
+async def deploy_vercel_site() -> str:
+    """Copies the site to a temp folder, deploys it to Vercel, returns the unique deployment URL."""
+    token = os.environ.get("VERCEL_TOKEN")
+    org_id = os.environ.get("VERCEL_ORG_ID")
+    project_id = os.environ.get("VERCEL_PROJECT_ID")
+    if not (token and org_id and project_id):
+        raise RuntimeError("VERCEL_TOKEN / VERCEL_ORG_ID / VERCEL_PROJECT_ID not set")
+    if not (SITE_DIR / "index.html").exists():
+        raise RuntimeError("site-src is empty (run: git submodule update --init --recursive)")
+
+    vercel = str(VERCEL_BIN) if VERCEL_BIN.exists() else "vercel"
+    tmp = tempfile.mkdtemp(prefix="ubg-")
+    try:
+        site_copy = Path(tmp) / "site"
+        await asyncio.to_thread(shutil.copytree, SITE_DIR, site_copy, ignore=SITE_SKIP)
+
+        proc = await asyncio.create_subprocess_exec(
+            vercel, "deploy", str(site_copy), "--yes",  # token and project come from env, not argv
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "VERCEL_TOKEN": token, "VERCEL_ORG_ID": org_id, "VERCEL_PROJECT_ID": project_id},
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("vercel timed out")
+        out_text = out.decode(errors="ignore")
+        err_text = err.decode(errors="ignore")
+        if proc.returncode != 0:
+            raise RuntimeError((err_text or out_text)[-400:])
+        # Vercel prints the deployment URL on stdout; fall back to stderr just in case
+        match = VERCEL_URL_RE.search(out_text) or VERCEL_URL_RE.search(err_text)
+        if not match:
+            raise RuntimeError(f"no URL found in vercel output: {(out_text + err_text)[-300:]}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return match.group(0)
+
 HOSTS = {
     "cloudflare": ("☁️ Cloudflare", deploy_site),
     "surge": ("⚡ Surge", deploy_surge_site),
+    "vercel": ("▲ Vercel", deploy_vercel_site),
 }
 
 async def generate_links(kinds: list[str], show_errors: bool = False) -> list[str]:
@@ -577,15 +621,19 @@ class LinkTypeView(View):
     async def surge_btn(self, interaction: discord.Interaction, button: Button):
         await self._run(interaction, ["surge"])
 
-    @discord.ui.button(label="Both", emoji="🔗", style=discord.ButtonStyle.success)
-    async def both_btn(self, interaction: discord.Interaction, button: Button):
-        await self._run(interaction, ["cloudflare", "surge"])
+    @discord.ui.button(label="Vercel", emoji="▲", style=discord.ButtonStyle.primary)
+    async def vercel_btn(self, interaction: discord.Interaction, button: Button):
+        await self._run(interaction, ["vercel"])
+
+    @discord.ui.button(label="All", emoji="🔗", style=discord.ButtonStyle.success)
+    async def all_btn(self, interaction: discord.Interaction, button: Button):
+        await self._run(interaction, list(HOSTS))
 
 async def makelink_after_password(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Which type of link do you want?", view=LinkTypeView(), ephemeral=True)
 
-@bot.hybrid_command(name="makelink", description="Generates a fresh Cloudflare and/or Surge link (password required).")
+@bot.hybrid_command(name="makelink", description="Generates a fresh Cloudflare, Surge and/or Vercel link (password required).")
 async def makelink(ctx: commands.Context):
     if ctx.interaction is None:  # typed as !makelink: a password typed in chat would be public
         await ctx.send(SLASH_ONLY_MSG)
@@ -597,13 +645,15 @@ async def makelink(ctx: commands.Context):
 # ==========================================
 AUTOLINK_INTERVAL_MIN = 30  # how often a new link is posted (minutes)
 autolink_channel_id = int(os.environ.get("AUTOLINK_CHANNEL_ID", "0") or 0)
+# Which hosts the timer posts links for. Override with AUTOLINK_HOSTS=cloudflare,surge,vercel (any subset).
+AUTOLINK_HOSTS = [h.strip() for h in os.environ.get("AUTOLINK_HOSTS", "cloudflare,surge,vercel").split(",") if h.strip() in HOSTS] or list(HOSTS)
 
 @tasks.loop(minutes=AUTOLINK_INTERVAL_MIN)
 async def autolink_loop():
     channel = bot.get_channel(autolink_channel_id)
     if channel is None:
         return
-    lines = await generate_links(["cloudflare", "surge"])
+    lines = await generate_links(AUTOLINK_HOSTS)
     if all("❌ failed" in line for line in lines):
         print("autolink: both deploys failed, nothing posted")
         return
@@ -617,7 +667,7 @@ async def autolink_loop():
 async def before_autolink_loop():
     await bot.wait_until_ready()
 
-@bot.hybrid_group(name="autolink", description="Auto-post fresh Cloudflare + Surge links on a timer.")
+@bot.hybrid_group(name="autolink", description="Auto-post fresh links on a timer.")
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def autolink(ctx: commands.Context):
