@@ -12,7 +12,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import Button, View
+from dotenv import load_dotenv
 from flask import Flask
+
+load_dotenv()  # reads DISCORD_TOKEN, SURGE_TOKEN, SURGE_LOGIN from .env (ignored on Render, which uses its own env vars)
 
 # ==========================================
 # 1. EMBEDDED WEB SERVER FOR RENDER PINGING
@@ -392,6 +395,7 @@ async def deploy_surge_site() -> str:
             surge, str(site_copy), domain, "--token", token,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "SURGE_TOKEN": token, "SURGE_LOGIN": os.environ.get("SURGE_LOGIN", "")},
         )
         try:
             _, err = await asyncio.wait_for(proc.communicate(), timeout=180)

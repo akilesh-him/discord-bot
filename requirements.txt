@@ -1,3 +1,5 @@
 discord.py
 flask
 gunicorn
+python-dotenv
+python-dotenv
