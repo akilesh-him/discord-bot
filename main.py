@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import os
 import random
 import secrets
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.ui import Button, View
 from dotenv import load_dotenv
 from flask import Flask
@@ -62,6 +63,9 @@ bot = CustomBot()
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     await bot.change_presence(activity=discord.Game(name="/cmds | Carl-Style"))
+    # Resume auto link posting after a restart if a channel is saved in the environment
+    if autolink_channel_id and not autolink_loop.is_running():
+        autolink_loop.start()
 
 # ==========================================
 # 3. SETUP COMMANDS (Join/Leave/AutoRole)
@@ -169,7 +173,7 @@ async def list_commands(ctx: commands.Context):
     )
     embed.add_field(
         name="🛠️ Utilities & UI",
-        value="`/panel`, `/makelink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
+        value="`/panel`, `/makelink`, `/autolink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
         inline=False
     )
     embed.add_field(
@@ -411,17 +415,105 @@ async def deploy_surge_site() -> str:
 
     return f"https://{domain}"
 
-@bot.hybrid_command(name="makelink", description="Generates a fresh ubgforever surge.sh link.")
-@commands.cooldown(1, 60, commands.BucketType.user)
-async def makelink(ctx: commands.Context):
-    await ctx.defer(ephemeral=True)
+# --- Password gate: every command that creates a site asks for LINK_PASSWORD in a private pop-up ---
+LINK_PASSWORD = os.environ.get("LINK_PASSWORD", "")
+
+def password_ok(entered: str) -> bool:
+    return bool(LINK_PASSWORD) and hmac.compare_digest(entered.encode(), LINK_PASSWORD.encode())
+
+class PasswordModal(discord.ui.Modal):
+    password = discord.ui.TextInput(label="Password", placeholder="Enter the password", max_length=100)
+
+    def __init__(self, on_success):
+        super().__init__(title="Password required", timeout=300)
+        self.on_success = on_success
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not LINK_PASSWORD:
+            await interaction.response.send_message(
+                "❌ No password is set on the bot yet (LINK_PASSWORD).", ephemeral=True)
+            return
+        if not password_ok(self.password.value):
+            await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
+            return
+        await self.on_success(interaction)
+
+SLASH_ONLY_MSG = "🔒 Please use the slash command version, since it asks for the password privately."
+
+async def makelink_after_password(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         url = await deploy_surge_site()
     except Exception as e:
         print(f"makelink failed: {e!r}")  # full error stays in your Render logs only
-        await ctx.send("❌ Couldn't generate a link right now. Try again in a bit.", ephemeral=True)
+        await interaction.followup.send("❌ Couldn't generate a link right now. Try again in a bit.", ephemeral=True)
         return
-    await ctx.send(f"✅ Here's your link: {url}", ephemeral=True)
+    await interaction.followup.send(f"✅ Here's your link: {url}", ephemeral=True)
+
+@bot.hybrid_command(name="makelink", description="Generates a fresh ubgforever surge.sh link (password required).")
+@commands.cooldown(1, 60, commands.BucketType.user)
+async def makelink(ctx: commands.Context):
+    if ctx.interaction is None:  # typed as !makelink: a password typed in chat would be public
+        await ctx.send(SLASH_ONLY_MSG)
+        return
+    await ctx.interaction.response.send_modal(PasswordModal(makelink_after_password))
+
+# ==========================================
+# 9.6 AUTO LINK POSTER (/autolink)
+# ==========================================
+AUTOLINK_INTERVAL_MIN = 30  # how often a new link is posted (minutes)
+autolink_channel_id = int(os.environ.get("AUTOLINK_CHANNEL_ID", "0") or 0)
+
+@tasks.loop(minutes=AUTOLINK_INTERVAL_MIN)
+async def autolink_loop():
+    channel = bot.get_channel(autolink_channel_id)
+    if channel is None:
+        return
+    try:
+        url = await deploy_surge_site()
+    except Exception as e:
+        print(f"autolink deploy failed: {e!r}")
+        return
+
+    try:
+        await channel.send(f"🔗 New link: {url}")
+    except discord.HTTPException as e:
+        print(f"autolink could not post: {e!r}")
+
+@autolink_loop.before_loop
+async def before_autolink_loop():
+    await bot.wait_until_ready()
+
+@bot.hybrid_group(name="autolink", description="Auto-post a fresh surge link on a timer.")
+@commands.has_permissions(administrator=True)
+async def autolink(ctx: commands.Context):
+    if ctx.invoked_subcommand is None:
+        await ctx.send("Use `/autolink start #channel` or `/autolink stop`.")
+
+@autolink.command(name="start", description="Start posting a new link every 30 minutes in a channel.")
+@commands.has_permissions(administrator=True)
+async def autolink_start(ctx: commands.Context, channel: discord.TextChannel):
+    if ctx.interaction is None:  # typed as !autolink start: a password typed in chat would be public
+        await ctx.send(SLASH_ONLY_MSG)
+        return
+
+    async def after_password(interaction: discord.Interaction):
+        global autolink_channel_id
+        autolink_channel_id = channel.id
+        if not autolink_loop.is_running():
+            autolink_loop.start()
+        await interaction.response.send_message(
+            f"✅ Posting a new link every {AUTOLINK_INTERVAL_MIN} min in {channel.mention}. "
+            f"(To keep this after a restart, set `AUTOLINK_CHANNEL_ID={channel.id}` in your environment.)"
+        )
+
+    await ctx.interaction.response.send_modal(PasswordModal(after_password))
+
+@autolink.command(name="stop", description="Stop the auto link posting.")
+@commands.has_permissions(administrator=True)
+async def autolink_stop(ctx: commands.Context):
+    autolink_loop.cancel()
+    await ctx.send("🛑 Auto link posting stopped.")
 
 # ==========================================
 # ERROR HANDLING
@@ -443,6 +535,9 @@ async def makelink(ctx: commands.Context):
 @slowmode.error
 @say.error
 @send_panel.error
+@autolink.error
+@autolink_start.error
+@autolink_stop.error
 async def permissions_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You do not have permission to execute this command.", ephemeral=True)
