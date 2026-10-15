@@ -1,6 +1,13 @@
+import asyncio
 import os
 import random
+import secrets
+import shutil
+import tempfile
 import threading
+from datetime import timedelta
+from pathlib import Path
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -98,7 +105,7 @@ async def on_member_join(member):
     # Welcome message
     channel_id = join_channels.get(member.guild.id)
     channel = member.guild.get_channel(channel_id) if channel_id else discord.utils.get(member.guild.text_channels, name="welcome")
-    
+
     if channel:
         embed = discord.Embed(
             title=f"👋 Welcome to {member.guild.name}!",
@@ -113,7 +120,7 @@ async def on_member_join(member):
 async def on_member_remove(member):
     channel_id = leave_channels.get(member.guild.id)
     channel = member.guild.get_channel(channel_id) if channel_id else discord.utils.get(member.guild.text_channels, name="goodbye")
-    
+
     if channel:
         embed = discord.Embed(
             title="📤 Member Left",
@@ -157,7 +164,7 @@ async def list_commands(ctx: commands.Context):
     )
     embed.add_field(
         name="🛠️ Utilities & UI",
-        value="`/panel`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
+        value="`/panel`, `/makelink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
         inline=False
     )
     embed.add_field(
@@ -168,7 +175,7 @@ async def list_commands(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="poll", description="Creates a simple voting poll.")
-async def poll(ctx: commands.Context, question: str):
+async def poll(ctx: commands.Context, *, question: str):
     embed = discord.Embed(
         title="📊 Server Poll",
         description=question,
@@ -203,10 +210,11 @@ async def ping(ctx: commands.Context):
 @bot.hybrid_command(name="whois", description="Displays info about a user.")
 async def whois(ctx: commands.Context, member: discord.Member = None):
     member = member or ctx.author
+    joined = member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown"
     embed = discord.Embed(title=f"User Info - {member.name}", color=member.color)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="ID", value=member.id, inline=True)
-    embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Joined Server", value=joined, inline=True)
     embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
     await ctx.send(embed=embed)
 
@@ -226,7 +234,7 @@ async def serverinfo(ctx: commands.Context):
 # ==========================================
 
 @bot.hybrid_command(name="8ball", description="Ask the Magic 8-Ball a question.")
-async def eightball(ctx: commands.Context, question: str):
+async def eightball(ctx: commands.Context, *, question: str):
     responses = [
         "It is certain.", "Without a doubt.", "Yes definitely.", "Reply hazy, try again.",
         "Ask again later.", "Better not tell you now.", "Don't count on it.",
@@ -245,6 +253,9 @@ async def coinflip(ctx: commands.Context):
 
 @bot.hybrid_command(name="roll", description="Rolls a random number dice.")
 async def roll(ctx: commands.Context, sides: int = 6):
+    if sides < 1:
+        await ctx.send("❌ The dice needs at least 1 side.", ephemeral=True)
+        return
     result = random.randint(1, sides)
     await ctx.send(f"🎲 Rolled a **{result}** (out of {sides})!")
 
@@ -282,13 +293,12 @@ async def unban(ctx: commands.Context, user_id: str, *, reason: str = "No reason
         user = await bot.fetch_user(int(user_id))
         await ctx.guild.unban(user, reason=reason)
         await ctx.send(f"🔓 Unbanned **{user.name}** | Reason: {reason}")
-    except Exception as e:
+    except Exception:
         await ctx.send(f"❌ Failed to unban ID {user_id}. Ensure the ID is valid and user is banned.")
 
 @bot.hybrid_command(name="mute", description="Timeouts/mutes a member for a specified number of minutes.")
 @commands.has_permissions(moderate_members=True)
 async def mute(ctx: commands.Context, member: discord.Member, minutes: int, *, reason: str = "No reason provided."):
-    from datetime import timedelta
     duration = timedelta(minutes=minutes)
     await member.timeout(duration, reason=reason)
     await ctx.send(f"🔇 Muted **{member.display_name}** for {minutes} minutes. | Reason: {reason}")
@@ -353,7 +363,63 @@ async def send_panel(ctx: commands.Context):
     view = LinkDispenserView()
     await ctx.send(embed=embed, view=view)
 
-# Error handling
+# ==========================================
+# 9.5 SURGE LINK GENERATOR (/makelink)
+# ==========================================
+BASE_DIR = Path(__file__).resolve().parent
+SITE_DIR = BASE_DIR / "site-src"  # git submodule: akilesh-him/ubgforever-repo
+SURGE_BIN = BASE_DIR / "node_modules" / ".bin" / "surge"
+SITE_SKIP = shutil.ignore_patterns(
+    ".git", ".gitignore", "README.md", "build-links.js", "supabase-*.sql"
+)
+
+async def deploy_surge_site() -> str:
+    """Copies the site to a temp folder, deploys it to a fresh surge.sh subdomain, returns the URL."""
+    token = os.environ.get("SURGE_TOKEN")
+    if not token:
+        raise RuntimeError("SURGE_TOKEN is not set")
+    if not (SITE_DIR / "index.html").exists():
+        raise RuntimeError("site-src is empty (run: git submodule update --init --recursive)")
+
+    domain = f"ubg-{secrets.token_hex(3)}.surge.sh"
+    surge = str(SURGE_BIN) if SURGE_BIN.exists() else "surge"
+    tmp = tempfile.mkdtemp(prefix="ubg-")
+    try:
+        site_copy = Path(tmp) / "site"
+        await asyncio.to_thread(shutil.copytree, SITE_DIR, site_copy, ignore=SITE_SKIP)
+
+        proc = await asyncio.create_subprocess_exec(
+            surge, str(site_copy), domain, "--token", token,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("surge timed out")
+        if proc.returncode != 0:
+            raise RuntimeError(err.decode(errors="ignore")[-300:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return f"https://{domain}"
+
+@bot.hybrid_command(name="makelink", description="Generates a fresh ubgforever surge.sh link.")
+@commands.cooldown(1, 60, commands.BucketType.user)
+async def makelink(ctx: commands.Context):
+    await ctx.defer(ephemeral=True)
+    try:
+        url = await deploy_surge_site()
+    except Exception as e:
+        print(f"makelink failed: {e}")
+        await ctx.send("❌ Couldn't generate a link right now. Try again in a bit.", ephemeral=True)
+        return
+    await ctx.send(f"✅ Here's your link: {url}", ephemeral=True)
+
+# ==========================================
+# ERROR HANDLING
+# ==========================================
 @setup.error
 @setup_join.error
 @setup_leave.error
@@ -374,6 +440,11 @@ async def send_panel(ctx: commands.Context):
 async def permissions_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You do not have permission to execute this command.", ephemeral=True)
+
+@makelink.error
+async def makelink_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Try again in {error.retry_after:.0f}s.", ephemeral=True)
 
 # ==========================================
 # 10. RUN BOT
