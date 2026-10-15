@@ -514,15 +514,20 @@ HOSTS = {
     "surge": ("⚡ Surge", deploy_surge_site),
 }
 
-async def generate_links(kinds: list[str]) -> list[str]:
-    """Deploys to the chosen hosts in parallel. Returns one result line per host (link or failure note)."""
+async def generate_links(kinds: list[str], show_errors: bool = False) -> list[str]:
+    """Deploys to the chosen hosts in parallel. Returns one result line per host (link or failure note).
+    With show_errors=True the failure reason is included in the line (only used for private replies)."""
     results = await asyncio.gather(*(HOSTS[k][1]() for k in kinds), return_exceptions=True)
     lines = []
     for k, res in zip(kinds, results):
         label = HOSTS[k][0]
         if isinstance(res, Exception):
-            print(f"{k} deploy failed: {res!r}")  # full error stays in your logs only
-            lines.append(f"{label}: ❌ failed")
+            print(f"{k} deploy failed: {res!r}", flush=True)
+            detail = ""
+            if show_errors:
+                reason = (str(res) or repr(res))[-600:].replace("`", "'")
+                detail = f"\n```{type(res).__name__}: {reason}```"
+            lines.append(f"{label}: ❌ failed{detail}")
         else:
             lines.append(f"{label}: {res}")
     return lines
@@ -561,7 +566,7 @@ class LinkTypeView(View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="⏳ Generating your link...", view=self)
-        lines = await generate_links(kinds)
+        lines = await generate_links(kinds, show_errors=True)  # private reply, safe to show details
         await interaction.edit_original_response(content="\n".join(lines), view=None)
 
     @discord.ui.button(label="Cloudflare", emoji="☁️", style=discord.ButtonStyle.primary)
