@@ -373,7 +373,7 @@ BASE_DIR = Path(__file__).resolve().parent
 SITE_DIR = BASE_DIR / "site-src"  # git submodule: akilesh-him/ubgforever-repo
 SURGE_BIN = BASE_DIR / "node_modules" / ".bin" / "surge"
 SITE_SKIP = shutil.ignore_patterns(
-    ".git", ".gitignore", "README.md", "build-links.js", "supabase-*.sql"
+    ".git", ".gitignore", "CNAME", "README.md", "build-links.js", "supabase-*.sql"
 )
 
 async def deploy_surge_site() -> str:
@@ -416,8 +416,9 @@ async def makelink(ctx: commands.Context):
     try:
         url = await deploy_surge_site()
     except Exception as e:
-        print(f"makelink failed: {e}")
-        await ctx.send("❌ Couldn't generate a link right now. Try again in a bit.", ephemeral=True)
+        print(f"makelink failed: {e!r}")
+        # TEMP DEBUG: shows the real error (only you can see it). Swap back to a generic message once it works.
+        await ctx.send(f"❌ makelink failed: `{str(e)[:1500] or repr(e)}`", ephemeral=True)
         return
     await ctx.send(f"✅ Here's your link: {url}", ephemeral=True)
 
