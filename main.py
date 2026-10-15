@@ -32,15 +32,19 @@ class CustomBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
-        print("✅ Slash commands successfully synced with Discord!")
+        # Sync globally as well
+        try:
+            synced = await self.tree.sync()
+            print(f"✅ Synced {len(synced)} global commands.")
+        except Exception as e:
+            print(f"Sync error: {e}")
 
 bot = CustomBot()
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
-    await bot.change_presence(activity=discord.Game(name="/cmds | Carl-bot Style"))
+    await bot.change_presence(activity=discord.Game(name="!cmds | Carl-Style"))
 
 @bot.event
 async def on_member_join(member):
@@ -48,14 +52,25 @@ async def on_member_join(member):
     if channel:
         embed = discord.Embed(
             title=f"Welcome to the server, {member.name}!",
-            description="Type `/cmds` to see all available commands.",
+            description="Type `!cmds` or `/cmds` to see all available commands.",
             color=discord.Color.blue()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         await channel.send(embed=embed)
 
 # ==========================================
-# 3. HELP & UTILITY COMMANDS
+# 3. INSTANT SYNC COMMAND (Prefix command)
+# ==========================================
+@bot.command(name="sync")
+@commands.has_permissions(administrator=True)
+async def sync_commands(ctx: commands.Context):
+    """Forces instant command syncing to the current server."""
+    bot.tree.copy_global_to(guild=ctx.guild)
+    synced = await bot.tree.sync(guild=ctx.guild)
+    await ctx.send(f"✅ Successfully synced **{len(synced)}** commands instantly to this server!")
+
+# ==========================================
+# 4. HELP & UTILITY COMMANDS
 # ==========================================
 
 @bot.hybrid_command(name="cmds", description="Lists all available bot commands.")
@@ -72,7 +87,7 @@ async def list_commands(ctx: commands.Context):
     )
     embed.add_field(
         name="🛠️ Utilities & UI",
-        value="`/panel` (link dispenser), `/ping`, `/whois`, `/serverinfo`, `/cmds`",
+        value="`/panel` (link dispenser), `/ping`, `/whois`, `/serverinfo`, `/cmds`, `!sync`",
         inline=False
     )
     await ctx.send(embed=embed)
@@ -104,7 +119,7 @@ async def serverinfo(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 # ==========================================
-# 4. ADVANCED MODERATION COMMANDS
+# 5. ADVANCED MODERATION COMMANDS
 # ==========================================
 
 @bot.hybrid_command(name="kick", description="Kicks a member from the server.")
@@ -158,7 +173,7 @@ async def slowmode(ctx: commands.Context, seconds: int):
     await ctx.send(f"⏱️ Slowmode set to {seconds} seconds.")
 
 # ==========================================
-# 5. LINK-DISPENSER PANEL
+# 6. LINK-DISPENSER PANEL
 # ==========================================
 
 class LinkDispenserView(View):
@@ -188,6 +203,7 @@ async def send_panel(ctx: commands.Context):
     await ctx.send(embed=embed, view=view)
 
 # Error handling
+@sync_commands.error
 @kick.error
 @ban.error
 @mute.error
@@ -202,7 +218,7 @@ async def permissions_error(ctx: commands.Context, error):
         await ctx.send("❌ You do not have permission to execute this command.", ephemeral=True)
 
 # ==========================================
-# 6. RUN BOT
+# 7. RUN BOT
 # ==========================================
 token = os.environ.get("DISCORD_TOKEN")
 if token:
