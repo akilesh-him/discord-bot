@@ -418,9 +418,8 @@ async def makelink(ctx: commands.Context):
     try:
         url = await deploy_surge_site()
     except Exception as e:
-        print(f"makelink failed: {e!r}")
-        # TEMP DEBUG: shows the real error (only you can see it). Swap back to a generic message once it works.
-        await ctx.send(f"❌ makelink failed: `{str(e)[:1500] or repr(e)}`", ephemeral=True)
+        print(f"makelink failed: {e!r}")  # full error stays in your Render logs only
+        await ctx.send("❌ Couldn't generate a link right now. Try again in a bit.", ephemeral=True)
         return
     await ctx.send(f"✅ Here's your link: {url}", ephemeral=True)
 
