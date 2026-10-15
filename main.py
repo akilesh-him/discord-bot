@@ -15,7 +15,9 @@ from discord.ui import Button, View
 from dotenv import load_dotenv
 from flask import Flask
 
-load_dotenv()  # reads DISCORD_TOKEN, SURGE_TOKEN, SURGE_LOGIN from .env (ignored on Render, which uses its own env vars)
+# Reads DISCORD_TOKEN, SURGE_TOKEN, SURGE_LOGIN from the .env next to this file.
+# override=True so an empty variable already in the shell can't shadow it. Render has no .env, so it uses its own env vars.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 # ==========================================
 # 1. EMBEDDED WEB SERVER FOR RENDER PINGING
