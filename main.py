@@ -17,7 +17,8 @@ from discord.ui import Button, View
 from dotenv import load_dotenv
 from flask import Flask
 
-# Reads DISCORD_TOKEN, LINK_PASSWORD, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CF_PAGES_PROJECT
+# Reads DISCORD_TOKEN, LINK_PASSWORD, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CF_PAGES_PROJECT,
+# SURGE_TOKEN, SURGE_LOGIN
 # from the .env next to this file. Render has no .env, so it uses its own env vars.
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
@@ -580,7 +581,6 @@ async def makelink_after_password(interaction: discord.Interaction):
         "Which type of link do you want?", view=LinkTypeView(), ephemeral=True)
 
 @bot.hybrid_command(name="makelink", description="Generates a fresh Cloudflare and/or Surge link (password required).")
-@commands.cooldown(1, 60, commands.BucketType.user)
 async def makelink(ctx: commands.Context):
     if ctx.interaction is None:  # typed as !makelink: a password typed in chat would be public
         await ctx.send(SLASH_ONLY_MSG)
