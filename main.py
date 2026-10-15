@@ -555,7 +555,7 @@ async def deploy_vercel_site() -> str:
 HOSTS = {
     "cloudflare": ("☁️ Cloudflare", deploy_site),
     "surge": ("⚡ Surge", deploy_surge_site),
-    "vercel": ("▲ Vercel", deploy_vercel_site),
+    "vercel": ("🔺 Vercel", deploy_vercel_site),
 }
 
 async def generate_links(kinds: list[str], show_errors: bool = False) -> list[str]:
@@ -589,6 +589,17 @@ class PasswordModal(discord.ui.Modal):
         super().__init__(title="Password required", timeout=300)
         self.on_success = on_success
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"PasswordModal error: {error!r}", flush=True)
+        msg = f"❌ Something went wrong: {type(error).__name__}: {str(error)[-300:]}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def on_submit(self, interaction: discord.Interaction):
         if not LINK_PASSWORD:
             await interaction.response.send_message(
@@ -621,7 +632,7 @@ class LinkTypeView(View):
     async def surge_btn(self, interaction: discord.Interaction, button: Button):
         await self._run(interaction, ["surge"])
 
-    @discord.ui.button(label="Vercel", emoji="▲", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Vercel", emoji="🔺", style=discord.ButtonStyle.primary)
     async def vercel_btn(self, interaction: discord.Interaction, button: Button):
         await self._run(interaction, ["vercel"])
 
