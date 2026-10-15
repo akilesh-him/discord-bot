@@ -28,11 +28,10 @@ class CustomBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
+        intents.members = True  # Required for join/leave events
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Sync globally as well
         try:
             synced = await self.tree.sync()
             print(f"✅ Synced {len(synced)} global commands.")
@@ -46,20 +45,42 @@ async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     await bot.change_presence(activity=discord.Game(name="!cmds | Carl-Style"))
 
+# ==========================================
+# 3. WELCOME & LEAVE EVENTS
+# ==========================================
+
+# --- Welcome Message Event ---
 @bot.event
 async def on_member_join(member):
+    # Searches for a channel named 'welcome'
     channel = discord.utils.get(member.guild.text_channels, name="welcome")
     if channel:
         embed = discord.Embed(
-            title=f"Welcome to the server, {member.name}!",
-            description="Type `!cmds` or `/cmds` to see all available commands.",
-            color=discord.Color.blue()
+            title=f"👋 Welcome to {member.guild.name}!",
+            description=f"Welcome {member.mention}! We're glad to have you here.\n\nType `/cmds` or `!cmds` to view all available commands.",
+            color=discord.Color.green()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Member #{member.guild.member_count}")
+        await channel.send(embed=embed)
+
+# --- Leave Message Event ---
+@bot.event
+async def on_member_remove(member):
+    # Searches for a channel named 'goodbye' or falls back to 'welcome'
+    channel = discord.utils.get(member.guild.text_channels, name="goodbye") or discord.utils.get(member.guild.text_channels, name="welcome")
+    if channel:
+        embed = discord.Embed(
+            title="📤 Member Left",
+            description=f"**{member.name}** has left the server. We hope to see you again!",
+            color=discord.Color.red()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"Remaining members: {member.guild.member_count}")
         await channel.send(embed=embed)
 
 # ==========================================
-# 3. INSTANT SYNC COMMAND (Prefix command)
+# 4. INSTANT SYNC COMMAND
 # ==========================================
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
@@ -70,7 +91,7 @@ async def sync_commands(ctx: commands.Context):
     await ctx.send(f"✅ Successfully synced **{len(synced)}** commands instantly to this server!")
 
 # ==========================================
-# 4. HELP & UTILITY COMMANDS
+# 5. HELP & UTILITY COMMANDS
 # ==========================================
 
 @bot.hybrid_command(name="cmds", description="Lists all available bot commands.")
@@ -119,7 +140,7 @@ async def serverinfo(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 # ==========================================
-# 5. ADVANCED MODERATION COMMANDS
+# 6. MODERATION COMMANDS
 # ==========================================
 
 @bot.hybrid_command(name="kick", description="Kicks a member from the server.")
@@ -173,7 +194,7 @@ async def slowmode(ctx: commands.Context, seconds: int):
     await ctx.send(f"⏱️ Slowmode set to {seconds} seconds.")
 
 # ==========================================
-# 6. LINK-DISPENSER PANEL
+# 7. LINK-DISPENSER PANEL
 # ==========================================
 
 class LinkDispenserView(View):
@@ -218,7 +239,7 @@ async def permissions_error(ctx: commands.Context, error):
         await ctx.send("❌ You do not have permission to execute this command.", ephemeral=True)
 
 # ==========================================
-# 7. RUN BOT
+# 8. RUN BOT
 # ==========================================
 token = os.environ.get("DISCORD_TOKEN")
 if token:
