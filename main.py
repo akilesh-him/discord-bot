@@ -1,4 +1,5 @@
 import os
+import random
 import threading
 import discord
 from discord import app_commands
@@ -21,6 +22,11 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
+# In-memory storage for server configurations
+join_channels = {}
+leave_channels = {}
+auto_roles = {}
+
 # ==========================================
 # 2. DISCORD BOT SETUP
 # ==========================================
@@ -28,7 +34,7 @@ class CustomBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True  # Required for join/leave events
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -43,17 +49,56 @@ bot = CustomBot()
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
-    await bot.change_presence(activity=discord.Game(name="!cmds | Carl-Style"))
+    await bot.change_presence(activity=discord.Game(name="/cmds | Carl-Style"))
 
 # ==========================================
-# 3. WELCOME & LEAVE EVENTS
+# 3. SETUP COMMANDS (Join/Leave/AutoRole)
 # ==========================================
 
-# --- Welcome Message Event ---
+@bot.hybrid_group(name="setup", description="Configure bot settings for your server.")
+@commands.has_permissions(administrator=True)
+async def setup(ctx: commands.Context):
+    if ctx.invoked_subcommand is None:
+        await ctx.send("Use `/setup join`, `/setup leave`, or `/setup autorole` to configure settings.")
+
+@setup.command(name="join", description="Sets the channel where join/welcome messages will be sent.")
+@commands.has_permissions(administrator=True)
+async def setup_join(ctx: commands.Context, channel: discord.TextChannel):
+    join_channels[ctx.guild.id] = channel.id
+    await ctx.send(f"✅ Welcome messages will now be sent to {channel.mention}")
+
+@setup.command(name="leave", description="Sets the channel where leave/goodbye messages will be sent.")
+@commands.has_permissions(administrator=True)
+async def setup_leave(ctx: commands.Context, channel: discord.TextChannel):
+    leave_channels[ctx.guild.id] = channel.id
+    await ctx.send(f"✅ Leave messages will now be sent to {channel.mention}")
+
+@setup.command(name="autorole", description="Sets the default role automatically assigned to new members.")
+@commands.has_permissions(administrator=True)
+async def setup_autorole(ctx: commands.Context, role: discord.Role):
+    auto_roles[ctx.guild.id] = role.id
+    await ctx.send(f"✅ Auto-role set to **{role.name}**. New members will automatically receive this role.")
+
+# ==========================================
+# 4. WELCOME & LEAVE EVENTS
+# ==========================================
+
 @bot.event
 async def on_member_join(member):
-    # Searches for a channel named 'welcome'
-    channel = discord.utils.get(member.guild.text_channels, name="welcome")
+    # Auto-role assignment
+    role_id = auto_roles.get(member.guild.id)
+    if role_id:
+        role = member.guild.get_role(role_id)
+        if role:
+            try:
+                await member.add_roles(role)
+            except discord.Forbidden:
+                print("Could not assign auto-role: Missing permissions.")
+
+    # Welcome message
+    channel_id = join_channels.get(member.guild.id)
+    channel = member.guild.get_channel(channel_id) if channel_id else discord.utils.get(member.guild.text_channels, name="welcome")
+    
     if channel:
         embed = discord.Embed(
             title=f"👋 Welcome to {member.guild.name}!",
@@ -64,11 +109,11 @@ async def on_member_join(member):
         embed.set_footer(text=f"Member #{member.guild.member_count}")
         await channel.send(embed=embed)
 
-# --- Leave Message Event ---
 @bot.event
 async def on_member_remove(member):
-    # Searches for a channel named 'goodbye' or falls back to 'welcome'
-    channel = discord.utils.get(member.guild.text_channels, name="goodbye") or discord.utils.get(member.guild.text_channels, name="welcome")
+    channel_id = leave_channels.get(member.guild.id)
+    channel = member.guild.get_channel(channel_id) if channel_id else discord.utils.get(member.guild.text_channels, name="goodbye")
+    
     if channel:
         embed = discord.Embed(
             title="📤 Member Left",
@@ -80,38 +125,75 @@ async def on_member_remove(member):
         await channel.send(embed=embed)
 
 # ==========================================
-# 4. INSTANT SYNC COMMAND
+# 5. INSTANT SYNC COMMAND
 # ==========================================
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def sync_commands(ctx: commands.Context):
-    """Forces instant command syncing to the current server."""
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
     await ctx.send(f"✅ Successfully synced **{len(synced)}** commands instantly to this server!")
 
 # ==========================================
-# 5. HELP & UTILITY COMMANDS
+# 6. HELP & UTILITY COMMANDS
 # ==========================================
 
 @bot.hybrid_command(name="cmds", description="Lists all available bot commands.")
 async def list_commands(ctx: commands.Context):
     embed = discord.Embed(
-        title="📜 Carl-Style Bot Commands",
-        description="Here are all the active commands loaded on your bot:",
+        title="📜 Carl-Style Bot Commands List",
+        description="Here are all active commands loaded on your bot:",
         color=discord.Color.gold()
     )
     embed.add_field(
+        name="⚙️ Configuration",
+        value="`/setup join`, `/setup leave`, `/setup autorole`, `!sync`",
+        inline=False
+    )
+    embed.add_field(
         name="🛡️ Moderation",
-        value="`/kick`, `/ban`, `/mute` (timeout), `/unmute`, `/clear`, `/lock`, `/unlock`, `/slowmode`",
+        value="`/kick`, `/ban`, `/unban`, `/warn`, `/mute`, `/unmute`, `/clear`, `/lock`, `/unlock`, `/slowmode`",
         inline=False
     )
     embed.add_field(
         name="🛠️ Utilities & UI",
-        value="`/panel` (link dispenser), `/ping`, `/whois`, `/serverinfo`, `/cmds`, `!sync`",
+        value="`/panel`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
+        inline=False
+    )
+    embed.add_field(
+        name="🎲 Fun Games",
+        value="`/8ball`, `/coinflip`, `/roll`",
         inline=False
     )
     await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="poll", description="Creates a simple voting poll.")
+async def poll(ctx: commands.Context, question: str):
+    embed = discord.Embed(
+        title="📊 Server Poll",
+        description=question,
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=f"Poll started by {ctx.author.display_name}")
+    message = await ctx.send(embed=embed)
+    await message.add_reaction("👍")
+    await message.add_reaction("👎")
+
+@bot.hybrid_command(name="avatar", description="Displays a user's full profile picture.")
+async def avatar(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"Avatar - {member.name}", color=discord.Color.purple())
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="usercount", description="Shows total server members.")
+async def usercount(ctx: commands.Context):
+    await ctx.send(f"👥 **{ctx.guild.name}** currently has **{ctx.guild.member_count}** members!")
+
+@bot.hybrid_command(name="say", description="Makes the bot broadcast a message.")
+@commands.has_permissions(manage_messages=True)
+async def say(ctx: commands.Context, *, message: str):
+    await ctx.send(message)
 
 @bot.hybrid_command(name="ping", description="Checks the bot's latency.")
 async def ping(ctx: commands.Context):
@@ -140,8 +222,46 @@ async def serverinfo(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 # ==========================================
-# 6. MODERATION COMMANDS
+# 7. FUN COMMANDS
 # ==========================================
+
+@bot.hybrid_command(name="8ball", description="Ask the Magic 8-Ball a question.")
+async def eightball(ctx: commands.Context, question: str):
+    responses = [
+        "It is certain.", "Without a doubt.", "Yes definitely.", "Reply hazy, try again.",
+        "Ask again later.", "Better not tell you now.", "Don't count on it.",
+        "My reply is no.", "My sources say no.", "Outlook not so good.", "Very doubtful."
+    ]
+    answer = random.choice(responses)
+    embed = discord.Embed(title="🎱 Magic 8-Ball", color=discord.Color.dark_theme())
+    embed.add_field(name="Question:", value=question, inline=False)
+    embed.add_field(name="Answer:", value=answer, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="coinflip", description="Flips a coin.")
+async def coinflip(ctx: commands.Context):
+    result = random.choice(["Heads 🪙", "Tails 🪙"])
+    await ctx.send(f"🪙 Coin Flip Result: **{result}**!")
+
+@bot.hybrid_command(name="roll", description="Rolls a random number dice.")
+async def roll(ctx: commands.Context, sides: int = 6):
+    result = random.randint(1, sides)
+    await ctx.send(f"🎲 Rolled a **{result}** (out of {sides})!")
+
+# ==========================================
+# 8. EXTENDED MODERATION COMMANDS
+# ==========================================
+
+@bot.hybrid_command(name="warn", description="Issues a warning to a member.")
+@commands.has_permissions(kick_members=True)
+async def warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
+    embed = discord.Embed(
+        title="⚠️ Warning Issued",
+        description=f"**{member.display_name}** has been warned.",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="kick", description="Kicks a member from the server.")
 @commands.has_permissions(kick_members=True)
@@ -154,6 +274,16 @@ async def kick(ctx: commands.Context, member: discord.Member, *, reason: str = "
 async def ban(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
     await member.ban(reason=reason)
     await ctx.send(f"⛔ Banned **{member.display_name}** | Reason: {reason}")
+
+@bot.hybrid_command(name="unban", description="Unbans a user using their Discord User ID.")
+@commands.has_permissions(ban_members=True)
+async def unban(ctx: commands.Context, user_id: str, *, reason: str = "No reason provided."):
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await ctx.guild.unban(user, reason=reason)
+        await ctx.send(f"🔓 Unbanned **{user.name}** | Reason: {reason}")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to unban ID {user_id}. Ensure the ID is valid and user is banned.")
 
 @bot.hybrid_command(name="mute", description="Timeouts/mutes a member for a specified number of minutes.")
 @commands.has_permissions(moderate_members=True)
@@ -194,7 +324,7 @@ async def slowmode(ctx: commands.Context, seconds: int):
     await ctx.send(f"⏱️ Slowmode set to {seconds} seconds.")
 
 # ==========================================
-# 7. LINK-DISPENSER PANEL
+# 9. LINK-DISPENSER PANEL
 # ==========================================
 
 class LinkDispenserView(View):
@@ -224,22 +354,29 @@ async def send_panel(ctx: commands.Context):
     await ctx.send(embed=embed, view=view)
 
 # Error handling
+@setup.error
+@setup_join.error
+@setup_leave.error
+@setup_autorole.error
 @sync_commands.error
+@warn.error
 @kick.error
 @ban.error
+@unban.error
 @mute.error
 @unmute.error
 @clear.error
 @lock.error
 @unlock.error
 @slowmode.error
+@say.error
 @send_panel.error
 async def permissions_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You do not have permission to execute this command.", ephemeral=True)
 
 # ==========================================
-# 8. RUN BOT
+# 10. RUN BOT
 # ==========================================
 token = os.environ.get("DISCORD_TOKEN")
 if token:
