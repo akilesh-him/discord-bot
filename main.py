@@ -194,7 +194,7 @@ async def list_commands(ctx: commands.Context):
                     value="`/makelink`, `/autolink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`, `/embed`, `/botinfo`, `/uptime`, `/roleinfo`, `/channelinfo`, `/roles`, `/choose`, `/remind`",
                     inline=False)
     embed.add_field(name="🔗 Link Dispenser",
-                    value="`/links source`, `/links panel`, `/links scan`, `/links add`, `/links import`, `/links generate`, `/links status`, `/links clear`",
+                    value="`/links source`, `/links panel`, `/links scan`, `/links peek`, `/links add`, `/links import`, `/links generate`, `/links status`, `/links clear`",
                     inline=False)
     embed.add_field(name="🎲 Fun Games", value="`/8ball`, `/coinflip`, `/roll`, `/rps`, `/joke`, `/fact`, `/ship`, `/rate`, `/reverse`, `/hug`", inline=False)
     await ctx.send(embed=embed)
@@ -391,6 +391,11 @@ DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 DAILY_PULL_LIMIT = int(os.environ.get("DAILY_PULL_LIMIT", "2"))
 MAX_POOL = int(os.environ.get("MAX_POOL", "500"))  # when auto-generating, the oldest links are dropped past this size
 URL_REGEX = re.compile(r"https?://[^\s<>\)\]]+")
+# Links pasted without https:// (only for the hosts this bot generates links on)
+BARE_URL_REGEX = re.compile(
+    r"(?<![/\w.@-])((?:[a-z0-9-]+\.)+(?:surge\.sh|pages\.dev|vercel\.app|netlify\.app)(?:/[^\s<>\)\]]*)?)",
+    re.IGNORECASE,
+)
 
 # ---------- persistence (JSON file) ----------
 def load_data():
@@ -451,7 +456,9 @@ def extract_urls(text: str) -> list[str]:
     """Finds every URL in a block of text (trailing punctuation trimmed, duplicates removed, order kept)."""
     seen = set()
     urls = []
-    for raw in URL_REGEX.findall(text or ""):
+    candidates = list(URL_REGEX.findall(text or ""))
+    candidates += ["https://" + m for m in BARE_URL_REGEX.findall(text or "")]
+    for raw in candidates:
         url = raw.rstrip(".,;:!?\"'")
         if url and url not in seen:
             seen.add(url)
@@ -713,9 +720,12 @@ async def links_scan(interaction: discord.Interaction, limit: app_commands.Range
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     scanned = found = added = from_bots = unreadable = 0
+    oldest = newest = None
     try:
         async for message in channel.history(limit=limit or None, oldest_first=True):
             scanned += 1
+            oldest = oldest or message.created_at
+            newest = message.created_at
             if message.author.id == bot.user.id:
                 continue
             if message.author.bot:
@@ -747,6 +757,11 @@ async def links_scan(interaction: discord.Interaction, limit: app_commands.Range
         f"Total pool now: **{len(cfg['links'])}**\n"
         f"Messages from other bots (included): **{from_bots}**"
     )
+    if oldest:
+        result += f"\nRead from **{oldest:%Y-%m-%d}** to **{newest:%Y-%m-%d}**"
+    if scanned == 0:
+        result += ("\n⚠️ I read **0** messages. Check that I have **View Channel** and **Read Message History** "
+                   "in that channel (Discord returns nothing, with no error, when that permission is missing).")
     if unreadable:
         result += (f"\n⚠️ **{unreadable}** message(s) had no readable text. If that's a lot, check that "
                    "**Message Content Intent** is on in the developer portal (or they may just be images/files).")
@@ -825,6 +840,35 @@ async def links_generate(interaction: discord.Interaction):
         await inter.followup.send("\n".join(lines), ephemeral=True)
 
     await interaction.response.send_modal(PasswordModal(after_password))
+
+@links_group.command(name="peek", description="Show what the bot sees in the latest source-channel messages (troubleshooting)")
+@app_commands.describe(count="How many recent messages to show (max 15)")
+@app_commands.checks.has_permissions(administrator=True)
+async def links_peek(interaction: discord.Interaction, count: app_commands.Range[int, 1, 15] = 10):
+    cfg = get_guild_config(interaction.guild.id)
+    source_id = cfg.get("source_channel")
+    channel = interaction.guild.get_channel(source_id) if source_id else None
+    if channel is None:
+        await interaction.response.send_message("❌ Set a source channel first with `/links source`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    rows = []
+    try:
+        async for m in channel.history(limit=count):
+            kind = "BOT " if m.author.bot else "USER"
+            rows.append(f"{kind} {m.author.display_name[:18]:<18} text:{len(m.content):>4} embeds:{len(m.embeds)} "
+                        f"files:{len(m.attachments)} links:{len(message_urls(m))}")
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Couldn't read {channel.mention}: `{e}`", ephemeral=True)
+        return
+    if not rows:
+        await interaction.followup.send(
+            f"⚠️ I can't see any messages in {channel.mention}. Check **View Channel** and **Read Message History**.",
+            ephemeral=True)
+        return
+    note = "\n`text:0` on non-bot messages usually means Message Content Intent is off."
+    await interaction.followup.send(f"Latest {len(rows)} message(s) in {channel.mention}:\n```\n" + "\n".join(rows) + "\n```" + note,
+                                    ephemeral=True)
 
 bot.tree.add_command(links_group)
 
