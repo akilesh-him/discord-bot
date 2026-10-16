@@ -654,7 +654,7 @@ async def makelink(ctx: commands.Context):
 # ==========================================
 # 9.6 AUTO LINK POSTER (/autolink)
 # ==========================================
-AUTOLINK_INTERVAL_MIN = 30  # how often a new link is posted (minutes)
+AUTOLINK_INTERVAL_MIN = 60  # how often a new link is posted (minutes)
 autolink_channel_id = int(os.environ.get("AUTOLINK_CHANNEL_ID", "0") or 0)
 # Which hosts the timer posts links for. Override with AUTOLINK_HOSTS=cloudflare,surge,vercel (any subset).
 AUTOLINK_HOSTS = [h.strip() for h in os.environ.get("AUTOLINK_HOSTS", "cloudflare,surge,vercel").split(",") if h.strip() in HOSTS] or list(HOSTS)
@@ -685,7 +685,7 @@ async def autolink(ctx: commands.Context):
     if ctx.invoked_subcommand is None:
         await ctx.send("Use `/autolink start #channel` or `/autolink stop`.")
 
-@autolink.command(name="start", description="Start posting a new link every 30 minutes in a channel.")
+@autolink.command(name="start", description="Start posting a new link every 60 minutes in a channel.")
 @commands.has_permissions(administrator=True)
 async def autolink_start(ctx: commands.Context, channel: discord.TextChannel):
     if ctx.interaction is None:  # typed as !autolink start: a password typed in chat would be public
