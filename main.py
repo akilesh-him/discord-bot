@@ -1,7 +1,5 @@
 import asyncio
-import datetime
 import hmac
-import json
 import os
 import platform
 import random
@@ -17,7 +15,6 @@ from typing import Literal
 
 import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, View
 from dotenv import load_dotenv
@@ -25,7 +22,6 @@ from flask import Flask
 
 # Reads DISCORD_TOKEN, LINK_PASSWORD, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CF_PAGES_PROJECT,
 # SURGE_TOKEN, SURGE_LOGIN, VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
-# Optional: AUTOLINK_CHANNEL_ID, AUTOLINK_POST, AUTOLINK_HOSTS, DATA_FILE, DAILY_PULL_LIMIT, MAX_POOL
 # from the .env next to this file. Render has no .env, so it uses its own env vars.
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
@@ -62,7 +58,7 @@ class CustomBot(commands.Bot):
 
     async def setup_hook(self):
         # Re-register the persistent panel view so its button works after restarts
-        self.add_view(PanelView())
+        self.add_view(LinkDispenserView())
         try:
             synced = await self.tree.sync()
             print(f"✅ Synced {len(synced)} global commands.")
@@ -191,10 +187,7 @@ async def list_commands(ctx: commands.Context):
                     value="`/kick`, `/ban`, `/unban`, `/warn`, `/mute`, `/unmute`, `/clear`, `/lock`, `/unlock`, `/slowmode`, `/warnings`, `/clearwarnings`, `/nick`, `/addrole`, `/removerole`",
                     inline=False)
     embed.add_field(name="🛠️ Utilities & UI",
-                    value="`/makelink`, `/autolink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`, `/embed`, `/botinfo`, `/uptime`, `/roleinfo`, `/channelinfo`, `/roles`, `/choose`, `/remind`",
-                    inline=False)
-    embed.add_field(name="🔗 Link Dispenser",
-                    value="`/links source`, `/links panel`, `/links scan`, `/links peek`, `/links add`, `/links import`, `/links generate`, `/links status`, `/links clear`",
+                    value="`/panel`, `/makelink`, `/autolink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`, `/embed`, `/botinfo`, `/uptime`, `/roleinfo`, `/channelinfo`, `/roles`, `/choose`, `/remind`",
                     inline=False)
     embed.add_field(name="🎲 Fun Games", value="`/8ball`, `/coinflip`, `/roll`, `/rps`, `/joke`, `/fact`, `/ship`, `/rate`, `/reverse`, `/hug`", inline=False)
     await ctx.send(embed=embed)
@@ -385,507 +378,33 @@ async def slowmode(ctx: commands.Context, seconds: int):
     await ctx.send(f"⏱️ Slowmode set to {seconds} seconds.")
 
 # ==========================================
-# 9. LINK DISPENSER (stores links, shows a panel, hands them out)
+# 9. LINK-DISPENSER PANEL
 # ==========================================
-DATA_FILE = os.environ.get("DATA_FILE", "data.json")
-DAILY_PULL_LIMIT = int(os.environ.get("DAILY_PULL_LIMIT", "2"))
-MAX_POOL = int(os.environ.get("MAX_POOL", "500"))  # when auto-generating, the oldest links are dropped past this size
-URL_REGEX = re.compile(r"https?://[^\s<>\)\]]+")
-# Links pasted without https:// (only for the hosts this bot generates links on)
-BARE_URL_REGEX = re.compile(
-    r"(?<![/\w.@-])((?:[a-z0-9-]+\.)+(?:surge\.sh|pages\.dev|vercel\.app|netlify\.app)(?:/[^\s<>\)\]]*)?)",
-    re.IGNORECASE,
-)
-
-# ---------- persistence (JSON file) ----------
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except (OSError, ValueError) as e:
-            print(f"Could not read {DATA_FILE}, starting empty: {e!r}", flush=True)
-    return {"guilds": {}}
-
-def save_data(data):
-    # Write to a temp file first so a crash mid-write can't corrupt the real file
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, DATA_FILE)
-
-data = load_data()
-
-def get_guild_config(guild_id: int) -> dict:
-    gid = str(guild_id)
-    if gid not in data["guilds"]:
-        data["guilds"][gid] = {
-            "source_channel": None,
-            "panel_channel": None,
-            "panel_message": None,
-            "links": [],
-            "user_state": {},
-        }
-    cfg = data["guilds"][gid]
-    cfg.setdefault("user_state", {})
-    return cfg
-
-def today_utc() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-def get_user_state(cfg: dict, user_id: int) -> dict:
-    uid = str(user_id)
-    today = today_utc()
-    state = cfg["user_state"].get(uid)
-
-    if state is None:
-        state = {"day": today, "pull_count": 0, "seen_urls": []}
-        cfg["user_state"][uid] = state
-        return state
-
-    state.setdefault("seen_urls", [])
-
-    if state.get("day") != today:
-        state["day"] = today
-        state["pull_count"] = 0
-
-    return state
-
-# ---------- link helpers ----------
-def extract_urls(text: str) -> list[str]:
-    """Finds every URL in a block of text (trailing punctuation trimmed, duplicates removed, order kept)."""
-    seen = set()
-    urls = []
-    candidates = list(URL_REGEX.findall(text or ""))
-    candidates += ["https://" + m for m in BARE_URL_REGEX.findall(text or "")]
-    for raw in candidates:
-        url = raw.rstrip(".,;:!?\"'")
-        if url and url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
-
-def message_urls(message: discord.Message) -> list[str]:
-    """URLs from a message's text AND its embeds (bots often post links inside embeds)."""
-    parts = [message.content or ""]
-    for e in message.embeds:
-        for text in (e.url, e.title, e.description):
-            if text:
-                parts.append(text)
-        for f in e.fields:
-            if f.value:
-                parts.append(f.value)
-    return extract_urls("\n".join(parts))
-
-def _norm(url: str) -> str:
-    return url.rstrip("/")
-
-def add_links(cfg: dict, urls: list[str], author_id: int, author: str,
-              message_id: int = 0, generated: bool = False) -> int:
-    """Adds URLs that aren't already in the pool. Returns how many were actually new."""
-    links = cfg["links"]
-    existing = {_norm(l["url"]) for l in links}
-    added = 0
-    for url in urls:
-        if _norm(url) in existing:
-            continue
-        existing.add(_norm(url))
-        links.append({
-            "url": url,
-            "author_id": author_id,
-            "author": author,
-            "message_id": message_id,
-            "generated": generated,
-        })
-        added += 1
-    return added
-
-# ---------- panel ----------
-def build_panel_embed(guild_id: int) -> discord.Embed:
-    cfg = get_guild_config(guild_id)
-    description = "Click the button below to grab a random link!"
-    if cfg.get("source_channel"):
-        description += "\nWant to add a link? Just post it in the source channel."
-    embed = discord.Embed(title="📎 Link Panel", description=description, color=discord.Color.blurple())
-    embed.add_field(name="Links available", value=str(len(cfg["links"])), inline=True)
-    embed.add_field(name="Daily limit", value=f"{DAILY_PULL_LIMIT} pulls / user", inline=True)
-    embed.set_footer(text="One button. Infinite(ish) links.")
-    return embed
-
-class PanelView(discord.ui.View):
+class LinkDispenserView(View):
     def __init__(self):
         super().__init__(timeout=None)
+        self.add_item(Button(label="Website", url="https://example.com", style=discord.ButtonStyle.link))
+        self.add_item(Button(label="GitHub", url="https://github.com", style=discord.ButtonStyle.link))
+        self.add_item(Button(label="Rules", url="https://discord.com/terms", style=discord.ButtonStyle.link))
 
-    @discord.ui.button(label="Get a Link!", style=discord.ButtonStyle.primary, emoji="🎲",
-                       custom_id="linkpanel:getlink")
-    async def get_link(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        cfg = get_guild_config(interaction.guild.id)
-        links = cfg["links"]
-        if not links:
-            await interaction.response.send_message("📭 No links yet!", ephemeral=True)
-            return
-
-        state = get_user_state(cfg, interaction.user.id)
-
-        if state["pull_count"] >= DAILY_PULL_LIMIT:
-            await interaction.response.send_message(
-                f"⏳ You've hit your daily limit of **{DAILY_PULL_LIMIT}** links. Come back tomorrow (UTC).",
-                ephemeral=True,
-            )
-            return
-
-        seen = set(state["seen_urls"])
-        available = [l for l in links if l["url"] not in seen]
-
-        if not available:
-            await interaction.response.send_message(
-                "🎉 You've already received every link in the pool! Wait for new links to be added.",
-                ephemeral=True,
-            )
-            return
-
-        entry = random.choice(available)
-
-        state["pull_count"] += 1
-        state["seen_urls"].append(entry["url"])
-        save_data(data)
-
-        remaining = DAILY_PULL_LIMIT - state["pull_count"]
-        origin = "Freshly generated" if entry.get("generated") else f"Originally shared by {entry['author']}"
-
-        embed = discord.Embed(title="🎲 Your random link", description=f"<{entry['url']}>",
-                              color=discord.Color.green())
-        embed.set_footer(text=f"{origin} • {remaining} pull(s) left today")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-async def refresh_panel(guild: discord.Guild):
-    cfg = get_guild_config(guild.id)
-    panel_id = cfg.get("panel_channel")
-    if not panel_id:
-        return None
-    channel = guild.get_channel(panel_id)
-    if channel is None:
+    @discord.ui.button(label="Get Secret Link (DM)", style=discord.ButtonStyle.primary, custom_id="secret_link_btn")
+    async def secret_link(self, interaction: discord.Interaction, button: Button):
         try:
-            channel = await bot.fetch_channel(panel_id)
-        except discord.HTTPException:
-            return None
-    embed = build_panel_embed(guild.id)
-    msg_id = cfg.get("panel_message")
-    view = PanelView()
-    if msg_id:
-        try:
-            msg = await channel.fetch_message(msg_id)
-            await msg.edit(embed=embed, view=view)
-            return msg
-        except (discord.NotFound, discord.HTTPException):
-            cfg["panel_message"] = None
-    try:
-        msg = await channel.send(embed=embed, view=view)
-    except discord.HTTPException as e:
-        print(f"[panel] could not post panel: {e!r}", flush=True)
-        return None
-    cfg["panel_message"] = msg.id
-    save_data(data)
-    try:
-        await msg.pin()
-    except discord.HTTPException:
-        pass
-    return msg
+            await interaction.user.send("📩 Here is your requested link: https://example.com/secret")
+            await interaction.response.send_message("Check your Direct Messages!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("I couldn't DM you! Please enable DMs.", ephemeral=True)
 
-# ---------- collecting links from the source channel ----------
-@bot.event
-async def on_message(message: discord.Message):
-    # Other bots' messages ARE read; only this bot's own messages are skipped
-    if message.guild and message.author.id != bot.user.id:
-        cfg = get_guild_config(message.guild.id)
-        if cfg.get("source_channel") == message.channel.id:
-            urls = message_urls(message)
-            if urls and add_links(cfg, urls, message.author.id, str(message.author), message.id):
-                save_data(data)
-                await refresh_panel(message.guild)
-                try:
-                    await message.add_reaction("📎")
-                except discord.HTTPException:
-                    pass
-    await bot.process_commands(message)  # keep prefix commands like !sync working
-
-# ---------- generating links straight into the pool ----------
-async def generate_into_pool(guild: discord.Guild, kinds: list[str]):
-    """Deploys the site to the chosen hosts, adds the new URLs to this server's pool and refreshes the panel."""
-    results = await generate_results(kinds)
-    urls = []
-    for kind, res in results:
-        if isinstance(res, str):
-            urls.append(res)
-        else:
-            print(f"{kind} deploy failed: {res!r}", flush=True)
-    cfg = get_guild_config(guild.id)
-    added = add_links(cfg, urls, bot.user.id, "auto-generated", generated=True)
-    if len(cfg["links"]) > MAX_POOL:
-        del cfg["links"][:len(cfg["links"]) - MAX_POOL]
-    save_data(data)
-    await refresh_panel(guild)
-    return results, added
-
-# ---------- /links commands ----------
-links_group = app_commands.Group(
-    name="links",
-    description="Manage the link dispenser",
-    default_permissions=discord.Permissions(administrator=True),
-    guild_only=True,
-)
-
-@links_group.command(name="source", description="Set the channel to watch for links")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_source(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_guild_config(interaction.guild.id)
-    cfg["source_channel"] = channel.id
-    save_data(data)
-    await interaction.response.send_message(
-        f"✅ Source channel set to {channel.mention}.\n"
-        "New links posted there are collected automatically. "
-        "To also collect the links already in the channel, run `/links scan`.",
-        ephemeral=True,
+@bot.hybrid_command(name="panel", description="Posts the Link Dispenser Panel.")
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def send_panel(ctx: commands.Context):
+    embed = discord.Embed(
+        title="🔗 Server Link Dispenser",
+        description="Click buttons below for resources:",
+        color=discord.Color.green()
     )
-
-@links_group.command(name="panel", description="Set the channel where the link panel lives")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_panel(interaction: discord.Interaction, channel: discord.TextChannel):
-    cfg = get_guild_config(interaction.guild.id)
-    cfg["panel_channel"] = channel.id
-    cfg["panel_message"] = None
-    save_data(data)
-    await interaction.response.defer(ephemeral=True)
-    msg = await refresh_panel(interaction.guild)
-    if msg is None:
-        await interaction.followup.send(
-            f"⚠️ Panel channel set to {channel.mention}, but I couldn't post there. "
-            "Check that I can view the channel, send messages and embed links.",
-            ephemeral=True,
-        )
-        return
-    await interaction.followup.send(f"✅ Panel channel set to {channel.mention}.", ephemeral=True)
-
-@links_group.command(name="status", description="Show the current setup")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_status(interaction: discord.Interaction):
-    cfg = get_guild_config(interaction.guild.id)
-    src = f"<#{cfg['source_channel']}>" if cfg.get("source_channel") else "❌ not set"
-    pnl = f"<#{cfg['panel_channel']}>" if cfg.get("panel_channel") else "❌ not set"
-    generated = sum(1 for l in cfg["links"] if l.get("generated"))
-    auto = f"✅ every {AUTOLINK_INTERVAL_MIN} min ({', '.join(AUTOLINK_HOSTS)})" if autolink_loop.is_running() else "❌ off (`/autolink start`)"
-    embed = discord.Embed(title="⚙️ Link Dispenser Setup", color=discord.Color.green())
-    embed.add_field(name="Source channel", value=src, inline=False)
-    embed.add_field(name="Panel channel", value=pnl, inline=False)
-    embed.add_field(name="Links stored", value=f"{len(cfg['links'])} ({generated} generated)", inline=False)
-    embed.add_field(name="Auto-generate", value=auto, inline=False)
-    embed.add_field(name="Daily limit", value=f"{DAILY_PULL_LIMIT} / user", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@links_group.command(name="clear", description="Wipe all stored links and user history")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_clear(interaction: discord.Interaction):
-    cfg = get_guild_config(interaction.guild.id)
-    cfg["links"].clear()
-    cfg["user_state"] = {}
-    cfg["panel_message"] = None
-    save_data(data)
-    await interaction.response.defer(ephemeral=True)
-    await refresh_panel(interaction.guild)
-    await interaction.followup.send("🗑️ Cleared all links and user history.", ephemeral=True)
-
-@links_group.command(name="scan", description="Read the source channel's past messages and store every link found")
-@app_commands.describe(limit="How many recent messages to read (0 = the whole channel)")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_scan(interaction: discord.Interaction, limit: app_commands.Range[int, 0, 1000000] = 0):
-    cfg = get_guild_config(interaction.guild.id)
-    source_id = cfg.get("source_channel")
-    if not source_id:
-        await interaction.response.send_message("❌ Set a source channel first with `/links source`.", ephemeral=True)
-        return
-
-    channel = interaction.guild.get_channel(source_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(source_id)
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "❌ I can't find the source channel anymore. Set it again with `/links source`.", ephemeral=True)
-            return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    scanned = found = added = from_bots = unreadable = 0
-    oldest = newest = None
-    try:
-        async for message in channel.history(limit=limit or None, oldest_first=True):
-            scanned += 1
-            oldest = oldest or message.created_at
-            newest = message.created_at
-            if message.author.id == bot.user.id:
-                continue
-            if message.author.bot:
-                from_bots += 1
-            urls = message_urls(message)
-            if not urls:
-                if not message.content and not message.embeds:
-                    unreadable += 1
-                continue
-            found += len(urls)
-            added += add_links(cfg, urls, message.author.id, str(message.author), message.id)
-    except discord.Forbidden:
-        await interaction.followup.send(
-            f"❌ I can't read the history of {channel.mention}. "
-            "Give me **View Channel** and **Read Message History** there.", ephemeral=True)
-        return
-    except discord.HTTPException as e:
-        print(f"[scan] failed: {e!r}", flush=True)
-        await interaction.followup.send("❌ Discord returned an error while reading the channel. Try again in a bit.",
-                                        ephemeral=True)
-        return
-
-    save_data(data)
-    await refresh_panel(interaction.guild)
-
-    result = (
-        f"✅ Scanned **{scanned}** message(s) in {channel.mention}.\n"
-        f"Links found: **{found}** | New: **{added}** | Already stored: **{found - added}**\n"
-        f"Total pool now: **{len(cfg['links'])}**\n"
-        f"Messages from other bots (included): **{from_bots}**"
-    )
-    if oldest:
-        result += f"\nRead from **{oldest:%Y-%m-%d}** to **{newest:%Y-%m-%d}**"
-    if scanned == 0:
-        result += ("\n⚠️ I read **0** messages. Check that I have **View Channel** and **Read Message History** "
-                   "in that channel (Discord returns nothing, with no error, when that permission is missing).")
-    if unreadable:
-        result += (f"\n⚠️ **{unreadable}** message(s) had no readable text. If that's a lot, check that "
-                   "**Message Content Intent** is on in the developer portal (or they may just be images/files).")
-    try:
-        await interaction.followup.send(result, ephemeral=True)
-    except discord.HTTPException:
-        try:  # the interaction expired during a very long scan
-            await channel.send(result)
-        except discord.HTTPException:
-            pass
-
-@links_group.command(name="add", description="Paste text: every URL in it gets added to the pool")
-@app_commands.describe(text="Paste anything containing URLs (one per line, sentences, whatever)")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_add(interaction: discord.Interaction, text: str):
-    urls = extract_urls(text)
-    if not urls:
-        await interaction.response.send_message("❌ No URLs found in that text.", ephemeral=True)
-        return
-    cfg = get_guild_config(interaction.guild.id)
-    added = add_links(cfg, urls, interaction.user.id, f"added by {interaction.user}")
-    save_data(data)
-    await refresh_panel(interaction.guild)
-    await interaction.response.send_message(
-        f"✅ Added **{added}** new link(s) ({len(urls) - added} already stored). "
-        f"Total pool now: **{len(cfg['links'])}**", ephemeral=True)
-
-@links_group.command(name="import", description="Import links from a .txt file (one URL per line)")
-@app_commands.describe(file="A .txt file with one URL per line", password="The link password (LINK_PASSWORD)")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_import(interaction: discord.Interaction, file: discord.Attachment, password: str):
-    if not LINK_PASSWORD:
-        await interaction.response.send_message("❌ Importing is disabled: no LINK_PASSWORD is set on the bot.",
-                                                ephemeral=True)
-        return
-    if not password_ok(password):
-        await interaction.response.send_message("❌ Wrong password.", ephemeral=True)
-        return
-    if not file.filename.lower().endswith(".txt"):
-        await interaction.response.send_message("❌ Only `.txt` files are supported.", ephemeral=True)
-        return
-    if file.size > 2 * 1024 * 1024:
-        await interaction.response.send_message("❌ File too large (max 2 MB).", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    try:
-        raw = await file.read()
-        text = raw.decode("utf-8", errors="ignore")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Could not read file: `{e}`", ephemeral=True)
-        return
-
-    cfg = get_guild_config(interaction.guild.id)
-    urls = extract_urls(text)
-    added = add_links(cfg, urls, interaction.user.id, f"imported by {interaction.user}")
-    save_data(data)
-    await refresh_panel(interaction.guild)
-    await interaction.followup.send(
-        f"✅ Import complete. Added **{added}** new ({len(urls) - added} already stored). "
-        f"Total pool now: **{len(cfg['links'])}**", ephemeral=True)
-
-@links_group.command(name="generate", description="Generate fresh links now and add them to the pool (password required)")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_generate(interaction: discord.Interaction):
-    guild = interaction.guild
-
-    async def after_password(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
-        results, added = await generate_into_pool(guild, AUTOLINK_HOSTS)
-        lines = [f"✅ Added **{added}** new link(s). Pool now: **{len(get_guild_config(guild.id)['links'])}**"]
-        for kind, res in results:
-            if isinstance(res, Exception):
-                reason = (str(res) or repr(res))[-200:].replace("`", "'")
-                lines.append(f"{HOSTS[kind][0]}: ❌ `{type(res).__name__}: {reason}`")
-        await inter.followup.send("\n".join(lines), ephemeral=True)
-
-    await interaction.response.send_modal(PasswordModal(after_password))
-
-@links_group.command(name="peek", description="Show what the bot sees in the latest source-channel messages (troubleshooting)")
-@app_commands.describe(count="How many recent messages to show (max 15)")
-@app_commands.checks.has_permissions(administrator=True)
-async def links_peek(interaction: discord.Interaction, count: app_commands.Range[int, 1, 15] = 10):
-    cfg = get_guild_config(interaction.guild.id)
-    source_id = cfg.get("source_channel")
-    channel = interaction.guild.get_channel(source_id) if source_id else None
-    if channel is None:
-        await interaction.response.send_message("❌ Set a source channel first with `/links source`.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    rows = []
-    try:
-        async for m in channel.history(limit=count):
-            kind = "BOT " if m.author.bot else "USER"
-            rows.append(f"{kind} {m.author.display_name[:18]:<18} text:{len(m.content):>4} embeds:{len(m.embeds)} "
-                        f"files:{len(m.attachments)} links:{len(message_urls(m))}")
-    except discord.HTTPException as e:
-        await interaction.followup.send(f"❌ Couldn't read {channel.mention}: `{e}`", ephemeral=True)
-        return
-    if not rows:
-        await interaction.followup.send(
-            f"⚠️ I can't see any messages in {channel.mention}. Check **View Channel** and **Read Message History**.",
-            ephemeral=True)
-        return
-    note = "\n`text:0` on non-bot messages usually means Message Content Intent is off."
-    await interaction.followup.send(f"Latest {len(rows)} message(s) in {channel.mention}:\n```\n" + "\n".join(rows) + "\n```" + note,
-                                    ephemeral=True)
-
-bot.tree.add_command(links_group)
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = "❌ You need the Administrator permission to use this."
-    else:
-        print(f"[command error] {error!r}", flush=True)
-        msg = "❌ Something went wrong running that command."
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    except discord.HTTPException:
-        pass
+    await ctx.send(embed=embed, view=LinkDispenserView())
 
 # ==========================================
 # 9.5 CLOUDFLARE PAGES LINK GENERATOR (/makelink)
@@ -1046,16 +565,12 @@ HOSTS = {
     "vercel": ("🔺 Vercel", deploy_vercel_site),
 }
 
-async def generate_results(kinds: list[str]):
-    """Deploys to the chosen hosts in parallel. Returns [(kind, url_or_exception), ...]."""
-    results = await asyncio.gather(*(HOSTS[k][1]() for k in kinds), return_exceptions=True)
-    return list(zip(kinds, results))
-
 async def generate_links(kinds: list[str], show_errors: bool = False) -> list[str]:
     """Deploys to the chosen hosts in parallel. Returns one result line per host (link or failure note).
     With show_errors=True the failure reason is included in the line (only used for private replies)."""
+    results = await asyncio.gather(*(HOSTS[k][1]() for k in kinds), return_exceptions=True)
     lines = []
-    for k, res in await generate_results(kinds):
+    for k, res in zip(kinds, results):
         label = HOSTS[k][0]
         if isinstance(res, Exception):
             print(f"{k} deploy failed: {res!r}", flush=True)
@@ -1146,70 +661,61 @@ async def makelink(ctx: commands.Context):
 # ==========================================
 # 9.6 AUTO LINK POSTER (/autolink)
 # ==========================================
-AUTOLINK_INTERVAL_MIN = 30  # how often new links are generated (minutes)
+AUTOLINK_INTERVAL_MIN = 30  # how often a new link is posted (minutes)
 autolink_channel_id = int(os.environ.get("AUTOLINK_CHANNEL_ID", "0") or 0)
-# True = also post each batch publicly in that channel. False (default) = only add them to the dispenser pool.
-autolink_post = os.environ.get("AUTOLINK_POST", "0").strip().lower() in ("1", "true", "yes")
-# Which hosts the timer deploys to. Override with AUTOLINK_HOSTS=cloudflare,surge,vercel (any subset).
+# Which hosts the timer posts links for. Override with AUTOLINK_HOSTS=cloudflare,surge,vercel (any subset).
 AUTOLINK_HOSTS = [h.strip() for h in os.environ.get("AUTOLINK_HOSTS", "cloudflare,surge,vercel").split(",") if h.strip() in HOSTS] or list(HOSTS)
 
 @tasks.loop(minutes=AUTOLINK_INTERVAL_MIN)
 async def autolink_loop():
     channel = bot.get_channel(autolink_channel_id)
-    if channel is None or getattr(channel, "guild", None) is None:
+    if channel is None:
         return
-    results, added = await generate_into_pool(channel.guild, AUTOLINK_HOSTS)
-    ok = [(k, r) for k, r in results if isinstance(r, str)]
-    if not ok:
-        print("autolink: all deploys failed, nothing added", flush=True)
+    lines = await generate_links(AUTOLINK_HOSTS)
+    if all("❌ failed" in line for line in lines):
+        print("autolink: both deploys failed, nothing posted")
         return
 
-    if autolink_post:
-        lines = [f"{HOSTS[k][0]}: <{r}>" for k, r in ok]
-        try:
-            await channel.send("🔗 **New links:**\n" + "\n".join(lines))
-        except discord.HTTPException as e:
-            print(f"autolink could not post: {e!r}", flush=True)
+    try:
+        await channel.send("🔗 **New links:**\n" + "\n".join(lines))
+    except discord.HTTPException as e:
+        print(f"autolink could not post: {e!r}")
 
 @autolink_loop.before_loop
 async def before_autolink_loop():
     await bot.wait_until_ready()
 
-@bot.hybrid_group(name="autolink", description="Auto-generate fresh links on a timer.")
+@bot.hybrid_group(name="autolink", description="Auto-post fresh links on a timer.")
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def autolink(ctx: commands.Context):
     if ctx.invoked_subcommand is None:
         await ctx.send("Use `/autolink start #channel` or `/autolink stop`.")
 
-@autolink.command(name="start", description="Generate new links every 30 minutes into this server's dispenser pool.")
+@autolink.command(name="start", description="Start posting a new link every 30 minutes in a channel.")
 @commands.has_permissions(administrator=True)
-async def autolink_start(ctx: commands.Context, channel: discord.TextChannel, post: bool = False):
+async def autolink_start(ctx: commands.Context, channel: discord.TextChannel):
     if ctx.interaction is None:  # typed as !autolink start: a password typed in chat would be public
         await ctx.send(SLASH_ONLY_MSG)
         return
 
     async def after_password(interaction: discord.Interaction):
-        global autolink_channel_id, autolink_post
+        global autolink_channel_id
         autolink_channel_id = channel.id
-        autolink_post = post
         if not autolink_loop.is_running():
             autolink_loop.start()
-        where = f" and posting them in {channel.mention}" if post else " (not posting them publicly)"
         await interaction.response.send_message(
-            f"✅ Generating new links every {AUTOLINK_INTERVAL_MIN} min into the dispenser pool{where}.\n"
-            f"To keep this after a restart, set `AUTOLINK_CHANNEL_ID={channel.id}`"
-            f"{' and `AUTOLINK_POST=1`' if post else ''} in your environment.",
-            ephemeral=True,
+            f"✅ Posting a new link every {AUTOLINK_INTERVAL_MIN} min in {channel.mention}. "
+            f"(To keep this after a restart, set `AUTOLINK_CHANNEL_ID={channel.id}` in your environment.)"
         )
 
     await ctx.interaction.response.send_modal(PasswordModal(after_password))
 
-@autolink.command(name="stop", description="Stop the auto link generation.")
+@autolink.command(name="stop", description="Stop the auto link posting.")
 @commands.has_permissions(administrator=True)
 async def autolink_stop(ctx: commands.Context):
     autolink_loop.cancel()
-    await ctx.send("🛑 Auto link generation stopped.")
+    await ctx.send("🛑 Auto link posting stopped.")
 
 # ==========================================
 # 11. EXTRA COMMANDS
