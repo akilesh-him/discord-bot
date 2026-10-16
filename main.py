@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import os
 import random
 import re
@@ -7,7 +8,8 @@ import secrets
 import shutil
 import tempfile
 import threading
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -37,13 +39,19 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# In-memory storage for server configurations (resets on restart)
+# ==========================================
+# 2. IN-MEMORY STORAGE (resets on restart)
+# ==========================================
 join_channels = {}
 leave_channels = {}
 auto_roles = {}
+sniped = {}
+edited = {}
+afk_users = {}
+warnings = {}  # {guild_id: {user_id: [ {reason, moderator, time} ]}}
 
 # ==========================================
-# 2. DISCORD BOT SETUP
+# 3. DISCORD BOT SETUP
 # ==========================================
 class CustomBot(commands.Bot):
     def __init__(self):
@@ -53,7 +61,6 @@ class CustomBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Re-register the persistent panel view so its button works after restarts
         self.add_view(LinkDispenserView())
         try:
             synced = await self.tree.sync()
@@ -65,6 +72,8 @@ bot = CustomBot()
 
 @bot.event
 async def on_ready():
+    if not hasattr(bot, "start_time"):
+        bot.start_time = time.time()
     print(f'Logged in as {bot.user.name} ({bot.user.id})')
     await bot.change_presence(activity=discord.Game(name="/cmds | Carl-Style"))
     if autolink_channel_id and not autolink_loop.is_running():
@@ -87,7 +96,7 @@ def can_act_on(ctx: commands.Context, member: discord.Member) -> bool:
 HIERARCHY_MSG = "❌ You (or I) can't act on that member because of role hierarchy."
 
 # ==========================================
-# 3. SETUP COMMANDS (Join/Leave/AutoRole)
+# 4. SETUP COMMANDS (Join/Leave/AutoRole)
 # ==========================================
 @bot.hybrid_group(name="setup", description="Configure bot settings for your server.")
 @commands.guild_only()
@@ -115,7 +124,7 @@ async def setup_autorole(ctx: commands.Context, role: discord.Role):
     await ctx.send(f"✅ Auto-role set to **{role.name}**. New members will automatically receive this role.")
 
 # ==========================================
-# 4. WELCOME & LEAVE EVENTS
+# 5. WELCOME & LEAVE EVENTS
 # ==========================================
 @bot.event
 async def on_member_join(member):
@@ -149,7 +158,7 @@ async def on_member_remove(member):
     if channel:
         embed = discord.Embed(
             title="📤 Member Left",
-            description=f"**{member.name}** has left the server. We hope to see you again!",
+            description=f"**{member.display_name}** has left the server. We hope to see you again!",
             color=discord.Color.red()
         )
         embed.set_thumbnail(url=member.display_avatar.url)
@@ -157,18 +166,65 @@ async def on_member_remove(member):
         await channel.send(embed=embed)
 
 # ==========================================
-# 5. INSTANT SYNC COMMAND
+# 6. MESSAGE EVENTS (AFK, snipe, editsnipe)
+# ==========================================
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return await bot.process_commands(message)
+
+    # Remove AFK if the user talks
+    if message.author.id in afk_users:
+        del afk_users[message.author.id]
+        try:
+            await message.channel.send(f"👋 Welcome back, {message.author.mention}!",
+                                       delete_after=5, allowed_mentions=NO_MENTIONS)
+        except discord.HTTPException:
+            pass
+
+    # Notify if a mentioned user is AFK
+    for mention in message.mentions:
+        if mention.id in afk_users:
+            try:
+                await message.channel.send(f"💤 {mention.display_name} is AFK: {afk_users[mention.id]}",
+                                           delete_after=8, allowed_mentions=NO_MENTIONS)
+            except discord.HTTPException:
+                pass
+
+    await bot.process_commands(message)
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    sniped[message.channel.id] = {
+        "content": message.content,
+        "author": message.author,
+        "time": datetime.now(timezone.utc),
+    }
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if before.author.bot or not before.guild or before.content == after.content:
+        return
+    edited[before.channel.id] = {
+        "before": before.content,
+        "after": after.content,
+        "author": before.author,
+    }
+
+# ==========================================
+# 7. INSTANT SYNC COMMAND
 # ==========================================
 @bot.command(name="sync")
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def sync_commands(ctx: commands.Context):
-    bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
     await ctx.send(f"✅ Successfully synced **{len(synced)}** commands instantly to this server!")
 
 # ==========================================
-# 6. HELP & UTILITY COMMANDS
+# 8. HELP & UTILITY COMMANDS
 # ==========================================
 @bot.hybrid_command(name="cmds", description="Lists all available bot commands.")
 async def list_commands(ctx: commands.Context):
@@ -180,12 +236,14 @@ async def list_commands(ctx: commands.Context):
     embed.add_field(name="⚙️ Configuration",
                     value="`/setup join`, `/setup leave`, `/setup autorole`, `!sync`", inline=False)
     embed.add_field(name="🛡️ Moderation",
-                    value="`/kick`, `/ban`, `/unban`, `/warn`, `/mute`, `/unmute`, `/clear`, `/lock`, `/unlock`, `/slowmode`",
+                    value="`/kick`, `/ban`, `/softban`, `/unban`, `/banlist`, `/warn`, `/warnings`, `/clear`, `/purgeuser`, `/nuke`, `/mute`, `/unmute`, `/lock`, `/unlock`, `/slowmode`, `/nick`, `/role`",
                     inline=False)
-    embed.add_field(name="🛠️ Utilities & UI",
-                    value="`/panel`, `/makelink`, `/autolink`, `/poll`, `/avatar`, `/whois`, `/serverinfo`, `/usercount`, `/ping`, `/say`",
+    embed.add_field(name="🛠️ Utilities",
+                    value="`/panel`, `/makelink`, `/autolink`, `/poll`, `/avatar`, `/banner`, `/whois`, `/serverinfo`, `/botinfo`, `/roleinfo`, `/channelinfo`, `/icon`, `/usercount`, `/membercount`, `/invite`, `/emoji`, `/ping`, `/uptime`, `/say`, `/remind`, `/snipe`, `/editsnipe`, `/afk`",
                     inline=False)
-    embed.add_field(name="🎲 Fun Games", value="`/8ball`, `/coinflip`, `/roll`", inline=False)
+    embed.add_field(name="🎲 Fun",
+                    value="`/8ball`, `/coinflip`, `/roll`, `/dice`, `/choose`, `/reverse`, `/password`, `/rate`, `/ship`, `/rps`, `/truthordare`, `/joke`, `/quote`",
+                    inline=False)
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="poll", description="Creates a simple voting poll.")
@@ -203,10 +261,35 @@ async def avatar(ctx: commands.Context, member: discord.Member = None):
     embed.set_image(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
+@bot.hybrid_command(name="banner", description="Shows a user's banner.")
+async def banner(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    user = await bot.fetch_user(member.id)
+    if not user.banner:
+        await ctx.send(f"❌ {member.display_name} has no banner.")
+        return
+    embed = discord.Embed(title=f"{member.display_name}'s Banner", color=discord.Color.purple())
+    embed.set_image(url=user.banner.url)
+    await ctx.send(embed=embed)
+
 @bot.hybrid_command(name="usercount", description="Shows total server members.")
 @commands.guild_only()
 async def usercount(ctx: commands.Context):
     await ctx.send(f"👥 **{ctx.guild.name}** currently has **{ctx.guild.member_count}** members!")
+
+@bot.hybrid_command(name="membercount", description="Shows a breakdown of members.")
+@commands.guild_only()
+async def membercount(ctx: commands.Context):
+    guild = ctx.guild
+    humans = sum(1 for m in guild.members if not m.bot)
+    bots = guild.member_count - humans
+    online = sum(1 for m in guild.members if m.status != discord.Status.offline)
+    embed = discord.Embed(title=f"👥 {guild.name} Members", color=discord.Color.green())
+    embed.add_field(name="Total", value=guild.member_count, inline=True)
+    embed.add_field(name="Humans", value=humans, inline=True)
+    embed.add_field(name="Bots", value=bots, inline=True)
+    embed.add_field(name="Online", value=online, inline=True)
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="say", description="Makes the bot broadcast a message.")
 @commands.guild_only()
@@ -219,6 +302,16 @@ async def ping(ctx: commands.Context):
     latency = round(bot.latency * 1000)
     await ctx.send(f"Pong! 🏓 Latency: **{latency}ms**", ephemeral=True)
 
+@bot.hybrid_command(name="uptime", description="Shows how long the bot has been online.")
+async def uptime(ctx: commands.Context):
+    if not hasattr(bot, "start_time"):
+        bot.start_time = time.time()
+    delta = int(time.time() - bot.start_time)
+    d, rem = divmod(delta, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    await ctx.send(f"⏱️ Uptime: **{d}d {h}h {m}m {s}s**")
+
 @bot.hybrid_command(name="whois", description="Displays info about a user.")
 @commands.guild_only()
 async def whois(ctx: commands.Context, member: discord.Member = None):
@@ -229,6 +322,9 @@ async def whois(ctx: commands.Context, member: discord.Member = None):
     embed.add_field(name="ID", value=member.id, inline=True)
     embed.add_field(name="Joined Server", value=joined, inline=True)
     embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    if roles:
+        embed.add_field(name=f"Roles ({len(roles)})", value=" ".join(roles)[:1024], inline=False)
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="serverinfo", description="Displays info about this server.")
@@ -238,13 +334,126 @@ async def serverinfo(ctx: commands.Context):
     embed = discord.Embed(title=f"Server Info - {guild.name}", color=discord.Color.blurple())
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Owner", value=guild.owner, inline=True)
+    embed.add_field(name="Owner", value=str(guild.owner), inline=True)
     embed.add_field(name="Members", value=guild.member_count, inline=True)
-    embed.add_field(name="Creation Date", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Channels", value=len(guild.channels), inline=True)
+    embed.add_field(name="Roles", value=len(guild.roles), inline=True)
+    embed.add_field(name="Boosts", value=guild.premium_subscription_count, inline=True)
+    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
     await ctx.send(embed=embed)
 
+@bot.hybrid_command(name="botinfo", description="Shows information about the bot.")
+async def botinfo(ctx: commands.Context):
+    embed = discord.Embed(title="🤖 Bot Info", color=discord.Color.blurple())
+    embed.add_field(name="Name", value=str(bot.user), inline=True)
+    embed.add_field(name="ID", value=bot.user.id, inline=True)
+    embed.add_field(name="Servers", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Users", value=sum(g.member_count or 0 for g in bot.guilds), inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="discord.py", value=discord.__version__, inline=True)
+    if bot.user.avatar:
+        embed.set_thumbnail(url=bot.user.avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="roleinfo", description="Shows information about a role.")
+@commands.guild_only()
+async def roleinfo(ctx: commands.Context, role: discord.Role):
+    embed = discord.Embed(title=f"Role Info - {role.name}", color=role.color or discord.Color.default())
+    embed.add_field(name="ID", value=role.id, inline=True)
+    embed.add_field(name="Color", value=str(role.color), inline=True)
+    embed.add_field(name="Members", value=len(role.members), inline=True)
+    embed.add_field(name="Mentionable", value=role.mentionable, inline=True)
+    embed.add_field(name="Hoisted", value=role.hoist, inline=True)
+    embed.add_field(name="Position", value=role.position, inline=True)
+    embed.add_field(name="Created", value=role.created_at.strftime("%Y-%m-%d"), inline=False)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="channelinfo", description="Shows information about a channel.")
+@commands.guild_only()
+async def channelinfo(ctx: commands.Context, channel: discord.TextChannel = None):
+    channel = channel or ctx.channel
+    embed = discord.Embed(title=f"Channel Info - #{channel.name}", color=discord.Color.blurple())
+    embed.add_field(name="ID", value=channel.id, inline=True)
+    embed.add_field(name="Type", value=str(channel.type), inline=True)
+    embed.add_field(name="Topic", value=(channel.topic or "None")[:1024], inline=False)
+    embed.add_field(name="Slowmode", value=f"{channel.slowmode_delay}s", inline=True)
+    embed.add_field(name="NSFW", value=channel.is_nsfw(), inline=True)
+    embed.add_field(name="Created", value=channel.created_at.strftime("%Y-%m-%d"), inline=True)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="icon", description="Shows the server icon.")
+@commands.guild_only()
+async def icon(ctx: commands.Context):
+    if not ctx.guild.icon:
+        await ctx.send("❌ This server has no icon.")
+        return
+    embed = discord.Embed(title=f"{ctx.guild.name}'s Icon", color=discord.Color.blurple())
+    embed.set_image(url=ctx.guild.icon.url)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="invite", description="Get the bot's invite link.")
+async def invite(ctx: commands.Context):
+    perms = discord.Permissions(administrator=True)
+    url = discord.utils.oauth_url(bot.user.id, permissions=perms)
+    await ctx.send(f"🔗 Invite me: {url}")
+
+@bot.hybrid_command(name="emoji", description="Shows an emoji enlarged.")
+async def emoji(ctx: commands.Context, emoji: str):
+    try:
+        e = await commands.EmojiConverter().convert(ctx, emoji)
+        embed = discord.Embed(title=f"Emoji: {e.name}", color=discord.Color.gold())
+        embed.set_image(url=e.url)
+        await ctx.send(embed=embed)
+    except commands.BadArgument:
+        await ctx.send("❌ That's not a valid custom emoji.")
+
+@bot.hybrid_command(name="remind", description="Set a reminder in N minutes.")
+async def remind(ctx: commands.Context, minutes: int, *, text: str):
+    if not 1 <= minutes <= 1440:
+        await ctx.send("❌ Minutes must be 1–1440.", ephemeral=True)
+        return
+    await ctx.send(f"⏰ Reminder set for **{minutes} min** from now.", ephemeral=True)
+    await asyncio.sleep(minutes * 60)
+    try:
+        await ctx.author.send(f"⏰ Reminder: **{text}**")
+    except discord.Forbidden:
+        await ctx.send(f"{ctx.author.mention} ⏰ Reminder: **{text}**", allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="snipe", description="Show the last deleted message in this channel.")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def snipe(ctx: commands.Context):
+    data = sniped.get(ctx.channel.id)
+    if not data:
+        await ctx.send("❌ Nothing to snipe.", ephemeral=True)
+        return
+    embed = discord.Embed(description=data["content"] or "*[no text]*", color=discord.Color.orange(),
+                          timestamp=data["time"])
+    embed.set_author(name=str(data["author"]), icon_url=data["author"].display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="editsnipe", description="Show the last edited message.")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def editsnipe(ctx: commands.Context):
+    data = edited.get(ctx.channel.id)
+    if not data:
+        await ctx.send("❌ Nothing to show.", ephemeral=True)
+        return
+    embed = discord.Embed(color=discord.Color.blue())
+    embed.add_field(name="Before", value=data["before"] or "*[empty]*", inline=False)
+    embed.add_field(name="After", value=data["after"] or "*[empty]*", inline=False)
+    embed.set_author(name=str(data["author"]), icon_url=data["author"].display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="afk", description="Set an AFK status.")
+@commands.guild_only()
+async def afk(ctx: commands.Context, *, reason: str = "AFK"):
+    afk_users[ctx.author.id] = reason
+    await ctx.send(f"💤 {ctx.author.display_name} is now AFK: {reason}", allowed_mentions=NO_MENTIONS)
+
 # ==========================================
-# 7. FUN COMMANDS
+# 9. FUN COMMANDS
 # ==========================================
 @bot.hybrid_command(name="8ball", description="Ask the Magic 8-Ball a question.")
 async def eightball(ctx: commands.Context, *, question: str):
@@ -270,20 +479,139 @@ async def roll(ctx: commands.Context, sides: int = 6):
         return
     await ctx.send(f"🎲 Rolled a **{random.randint(1, sides)}** (out of {sides})!")
 
+@bot.hybrid_command(name="dice", description="Roll multiple dice (e.g. 3d6).")
+async def dice(ctx: commands.Context, notation: str = "1d6"):
+    m = re.match(r"^(\d{1,2})d(\d{1,4})$", notation.lower())
+    if not m:
+        await ctx.send("❌ Use format like `2d6` or `1d20`.", ephemeral=True)
+        return
+    count, sides = int(m.group(1)), int(m.group(2))
+    if count < 1 or count > 20 or sides < 2 or sides > 1000:
+        await ctx.send("❌ Max 20 dice, sides 2–1000.", ephemeral=True)
+        return
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    await ctx.send(f"🎲 `{notation}` → {rolls} (total: **{sum(rolls)}**)")
+
+@bot.hybrid_command(name="choose", description="Let the bot pick between options.")
+async def choose(ctx: commands.Context, *, options: str):
+    choices = [o.strip() for o in options.split("|") if o.strip()]
+    if len(choices) < 2:
+        await ctx.send("❌ Separate options with `|` (e.g. `pizza | sushi`).", ephemeral=True)
+        return
+    await ctx.send(f"🤔 I choose: **{random.choice(choices)}**")
+
+@bot.hybrid_command(name="reverse", description="Reverses your text.")
+async def reverse(ctx: commands.Context, *, text: str):
+    await ctx.send(text[::-1], allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="password", description="Generate a random password.")
+async def password(ctx: commands.Context, length: int = 16):
+    length = max(8, min(length, 64))
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
+    pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+    try:
+        await ctx.author.send(f"🔐 Your password ({length} chars): `{pwd}`")
+        await ctx.send("📩 Sent to your DMs!", ephemeral=True)
+    except discord.Forbidden:
+        await ctx.send("❌ Enable DMs so I can send it.", ephemeral=True)
+
+@bot.hybrid_command(name="rate", description="Rates something 0–10.")
+async def rate(ctx: commands.Context, *, thing: str):
+    await ctx.send(f"⭐ I rate **{thing}** a **{random.randint(0, 10)}/10**!")
+
+@bot.hybrid_command(name="ship", description="Ship two users.")
+async def ship(ctx: commands.Context, user1: discord.Member, user2: discord.Member = None):
+    user2 = user2 or ctx.author
+    score = random.randint(0, 100)
+    bar = "█" * (score // 10) + "░" * (10 - score // 10)
+    await ctx.send(f"💘 **{user1.display_name}** + **{user2.display_name}**\n`{bar}` **{score}%**",
+                   allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="rps", description="Rock, paper, scissors.")
+async def rps(ctx: commands.Context, choice: str):
+    choice = choice.lower()
+    if choice not in ("rock", "paper", "scissors"):
+        await ctx.send("❌ Choose rock, paper, or scissors.", ephemeral=True)
+        return
+    bot_choice = random.choice(["rock", "paper", "scissors"])
+    wins = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+    if choice == bot_choice:
+        result = "🤝 Tie!"
+    elif wins[choice] == bot_choice:
+        result = "🎉 You win!"
+    else:
+        result = "🤖 I win!"
+    await ctx.send(f"You: **{choice}** | Me: **{bot_choice}**\n{result}")
+
+@bot.hybrid_command(name="truthordare", description="Random truth or dare prompt.")
+async def truthordare(ctx: commands.Context):
+    truths = ["What's your most embarrassing moment?", "What's a secret you've never told anyone?",
+              "Who was your first crush?", "What's the biggest lie you've told?"]
+    dares = ["Send the last photo in your camera roll.", "Text your crush 'hi'.",
+             "Do 20 push-ups.", "Speak only in rhymes for 5 minutes."]
+    kind = random.choice(["truth", "dare"])
+    prompt = random.choice(truths if kind == "truth" else dares)
+    await ctx.send(f"🎭 **{kind.upper()}**: {prompt}", allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="joke", description="Tells a random joke.")
+async def joke(ctx: commands.Context):
+    jokes = [
+        "Why don't scientists trust atoms? Because they make up everything.",
+        "I told my computer I needed a break, and it said 'no problem — I'll go to sleep.'",
+        "Why did the scarecrow win an award? He was outstanding in his field.",
+        "Parallel lines have so much in common. It's a shame they'll never meet.",
+        "I'm reading a book about anti-gravity. It's impossible to put down.",
+    ]
+    await ctx.send(f"😂 {random.choice(jokes)}")
+
+@bot.hybrid_command(name="quote", description="Sends a random inspirational quote.")
+async def quote(ctx: commands.Context):
+    quotes = [
+        "The only way to do great work is to love what you do. — Steve Jobs",
+        "In the middle of difficulty lies opportunity. — Albert Einstein",
+        "It always seems impossible until it's done. — Nelson Mandela",
+        "The best time to plant a tree was 20 years ago. The second best time is now.",
+        "Don't watch the clock; do what it does. Keep going. — Sam Levenson",
+    ]
+    await ctx.send(f"💭 {random.choice(quotes)}")
+
 # ==========================================
-# 8. MODERATION COMMANDS
+# 10. MODERATION COMMANDS
 # ==========================================
 @bot.hybrid_command(name="warn", description="Issues a warning to a member.")
 @commands.guild_only()
 @commands.has_permissions(kick_members=True)
 async def warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
+    warnings.setdefault(ctx.guild.id, {}).setdefault(member.id, []).append({
+        "reason": reason,
+        "moderator": str(ctx.author),
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+    count = len(warnings[ctx.guild.id][member.id])
     embed = discord.Embed(
         title="⚠️ Warning Issued",
-        description=f"**{member.display_name}** has been warned.",
+        description=f"**{member.display_name}** has been warned. (Total: {count})",
         color=discord.Color.orange()
     )
     embed.add_field(name="Reason", value=reason, inline=False)
     await ctx.send(embed=embed, allowed_mentions=NO_MENTIONS)
+    try:
+        await member.send(f"⚠️ You were warned in **{ctx.guild.name}**: {reason}")
+    except discord.Forbidden:
+        pass
+
+@bot.hybrid_command(name="warnings", description="Lists a member's warnings.")
+@commands.guild_only()
+@commands.has_permissions(kick_members=True)
+async def warnings_cmd(ctx: commands.Context, member: discord.Member):
+    entries = warnings.get(ctx.guild.id, {}).get(member.id, [])
+    if not entries:
+        await ctx.send(f"✅ **{member.display_name}** has no warnings.")
+        return
+    lines = [f"**{i+1}.** {w['reason']} — *by {w['moderator']}*" for i, w in enumerate(entries)]
+    embed = discord.Embed(title=f"⚠️ Warnings for {member.display_name}",
+                          description="\n".join(lines)[:4000], color=discord.Color.orange())
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="kick", description="Kicks a member from the server.")
 @commands.guild_only()
@@ -305,6 +633,17 @@ async def ban(ctx: commands.Context, member: discord.Member, *, reason: str = "N
     await member.ban(reason=reason)
     await ctx.send(f"⛔ Banned **{member.display_name}** | Reason: {reason}", allowed_mentions=NO_MENTIONS)
 
+@bot.hybrid_command(name="softban", description="Bans then immediately unbans a member (clears messages).")
+@commands.guild_only()
+@commands.has_permissions(ban_members=True)
+async def softban(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
+    if not can_act_on(ctx, member):
+        await ctx.send(HIERARCHY_MSG, ephemeral=True)
+        return
+    await member.ban(reason=reason, delete_message_days=7)
+    await ctx.guild.unban(member, reason="Softban")
+    await ctx.send(f"🔨 Softbanned **{member.display_name}** | Reason: {reason}", allowed_mentions=NO_MENTIONS)
+
 @bot.hybrid_command(name="unban", description="Unbans a user using their Discord User ID.")
 @commands.guild_only()
 @commands.has_permissions(ban_members=True)
@@ -316,11 +655,24 @@ async def unban(ctx: commands.Context, user_id: str, *, reason: str = "No reason
     except Exception:
         await ctx.send(f"❌ Failed to unban ID {user_id}. Ensure the ID is valid and user is banned.", ephemeral=True)
 
+@bot.hybrid_command(name="banlist", description="Lists all banned users.")
+@commands.guild_only()
+@commands.has_permissions(ban_members=True)
+async def banlist(ctx: commands.Context):
+    bans = [entry async for entry in ctx.guild.bans(limit=50)]
+    if not bans:
+        await ctx.send("✅ No banned users.")
+        return
+    lines = [f"**{e.user}** (`{e.user.id}`) — {e.reason or 'No reason'}" for e in bans]
+    embed = discord.Embed(title=f"🔨 Bans ({len(bans)})", description="\n".join(lines)[:4000],
+                          color=discord.Color.red())
+    await ctx.send(embed=embed)
+
 @bot.hybrid_command(name="mute", description="Timeouts/mutes a member for a specified number of minutes.")
 @commands.guild_only()
 @commands.has_permissions(moderate_members=True)
 async def mute(ctx: commands.Context, member: discord.Member, minutes: int, *, reason: str = "No reason provided."):
-    if not 1 <= minutes <= 40320:  # Discord's max timeout is 28 days
+    if not 1 <= minutes <= 40320:
         await ctx.send("❌ Minutes must be between 1 and 40320 (28 days).", ephemeral=True)
         return
     if not can_act_on(ctx, member):
@@ -334,6 +686,9 @@ async def mute(ctx: commands.Context, member: discord.Member, minutes: int, *, r
 @commands.guild_only()
 @commands.has_permissions(moderate_members=True)
 async def unmute(ctx: commands.Context, member: discord.Member):
+    if not can_act_on(ctx, member):
+        await ctx.send(HIERARCHY_MSG, ephemeral=True)
+        return
     await member.timeout(None)
     await ctx.send(f"🔊 Unmuted **{member.display_name}**.", allowed_mentions=NO_MENTIONS)
 
@@ -342,11 +697,33 @@ async def unmute(ctx: commands.Context, member: discord.Member):
 @commands.has_permissions(manage_messages=True)
 async def clear(ctx: commands.Context, amount: int = 5):
     amount = max(1, min(amount, 100))
-    await ctx.defer(ephemeral=True)  # purging can take longer than 3 seconds
-    # A typed !clear has its own message to remove too; a slash command does not
-    limit = amount + 1 if ctx.interaction is None else amount
-    await ctx.channel.purge(limit=limit)
-    await ctx.send(f"🧹 Deleted {amount} messages.", ephemeral=True, delete_after=3)
+    if ctx.interaction is None:
+        await ctx.channel.purge(limit=amount + 1)
+        await ctx.send(f"🧹 Deleted {amount} messages.", delete_after=3)
+    else:
+        await ctx.defer(ephemeral=True)
+        await ctx.channel.purge(limit=amount)
+        await ctx.send(f"🧹 Deleted {amount} messages.", ephemeral=True, delete_after=3)
+
+@bot.hybrid_command(name="purgeuser", description="Delete recent messages from a specific user.")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def purgeuser(ctx: commands.Context, member: discord.Member, amount: int = 20):
+    amount = max(1, min(amount, 100))
+    deleted = await ctx.channel.purge(limit=amount * 3,
+                                      check=lambda m: m.author.id == member.id, bulk=True)
+    await ctx.send(f"🧹 Deleted **{len(deleted)}** messages from {member.mention}.",
+                   delete_after=3, allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="nuke", description="Clone and delete the current channel (full reset).")
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def nuke(ctx: commands.Context):
+    channel = ctx.channel
+    new = await channel.clone(reason=f"Nuked by {ctx.author}")
+    await new.edit(position=channel.position)
+    await channel.delete(reason=f"Nuked by {ctx.author}")
+    await new.send(f"💥 Channel nuked by {ctx.author.mention}.", allowed_mentions=NO_MENTIONS)
 
 @bot.hybrid_command(name="lock", description="Locks the current channel.")
 @commands.guild_only()
@@ -366,12 +743,40 @@ async def unlock(ctx: commands.Context):
 @commands.guild_only()
 @commands.has_permissions(manage_channels=True)
 async def slowmode(ctx: commands.Context, seconds: int):
-    seconds = max(0, min(seconds, 21600))  # Discord max is 6 hours
+    seconds = max(0, min(seconds, 21600))
     await ctx.channel.edit(slowmode_delay=seconds)
     await ctx.send(f"⏱️ Slowmode set to {seconds} seconds.")
 
+@bot.hybrid_command(name="nick", description="Change a member's nickname.")
+@commands.guild_only()
+@commands.has_permissions(manage_nicknames=True)
+async def nick(ctx: commands.Context, member: discord.Member, *, nickname: str = None):
+    if not can_act_on(ctx, member):
+        await ctx.send(HIERARCHY_MSG, ephemeral=True)
+        return
+    await member.edit(nick=nickname)
+    await ctx.send(f"✅ Nickname for **{member.display_name}** set to `{nickname or 'reset'}`.",
+                   allowed_mentions=NO_MENTIONS)
+
+@bot.hybrid_command(name="role", description="Add or remove a role from a member.")
+@commands.guild_only()
+@commands.has_permissions(manage_roles=True)
+async def role(ctx: commands.Context, member: discord.Member, role: discord.Role, action: str = "add"):
+    if action.lower() not in ("add", "remove"):
+        await ctx.send("❌ Action must be `add` or `remove`.", ephemeral=True)
+        return
+    if role >= ctx.guild.me.top_role:
+        await ctx.send("❌ That role is above mine.", ephemeral=True)
+        return
+    if action.lower() == "add":
+        await member.add_roles(role)
+        await ctx.send(f"✅ Added **{role.name}** to **{member.display_name}**.", allowed_mentions=NO_MENTIONS)
+    else:
+        await member.remove_roles(role)
+        await ctx.send(f"✅ Removed **{role.name}** from **{member.display_name}**.", allowed_mentions=NO_MENTIONS)
+
 # ==========================================
-# 9. LINK-DISPENSER PANEL
+# 11. LINK-DISPENSER PANEL
 # ==========================================
 class LinkDispenserView(View):
     def __init__(self):
@@ -400,20 +805,19 @@ async def send_panel(ctx: commands.Context):
     await ctx.send(embed=embed, view=LinkDispenserView())
 
 # ==========================================
-# 9.5 CLOUDFLARE PAGES LINK GENERATOR (/makelink)
+# 12. CLOUDFLARE PAGES LINK GENERATOR (/makelink)
 # ==========================================
 BASE_DIR = Path(__file__).resolve().parent
-SITE_DIR = BASE_DIR / "site-src"  # git submodule: akilesh-him/ubgforever-repo
+SITE_DIR = BASE_DIR / "site-src"
 WRANGLER_BIN = BASE_DIR / "node_modules" / ".bin" / "wrangler"
 SITE_SKIP = shutil.ignore_patterns(
     ".git", ".gitignore", "CNAME", "README.md", "build-links.js", "supabase-*.sql"
 )
 PAGES_URL_RE = re.compile(r"https://[a-z0-9-]+\.[a-z0-9-]+\.pages\.dev")
-KEEP_DEPLOYMENTS = 20  # how many recent links stay alive
+KEEP_DEPLOYMENTS = 20
 _background_tasks = set()
 
 async def cleanup_old_deployments():
-    """Deletes all but the newest KEEP_DEPLOYMENTS deployments so the project doesn't pile up."""
     token = os.environ.get("CLOUDFLARE_API_TOKEN")
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     project = os.environ.get("CF_PAGES_PROJECT")
@@ -425,7 +829,7 @@ async def cleanup_old_deployments():
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(base, params={"per_page": 100}) as r:
                 deployments = (await r.json()).get("result", [])
-            for d in deployments[KEEP_DEPLOYMENTS:]:  # API returns newest first
+            for d in deployments[KEEP_DEPLOYMENTS:]:
                 async with session.delete(f"{base}/{d['id']}", params={"force": "true"}) as r:
                     if r.status >= 400:
                         print(f"cleanup: could not delete {d['id']}: {r.status}")
@@ -433,7 +837,6 @@ async def cleanup_old_deployments():
         print(f"cleanup failed: {e!r}")
 
 async def deploy_site() -> str:
-    """Copies the site to a temp folder, deploys it to Cloudflare Pages, returns the unique deployment URL."""
     token = os.environ.get("CLOUDFLARE_API_TOKEN")
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     project = os.environ.get("CF_PAGES_PROJECT")
@@ -444,6 +847,7 @@ async def deploy_site() -> str:
 
     wrangler = str(WRANGLER_BIN) if WRANGLER_BIN.exists() else "wrangler"
     tmp = tempfile.mkdtemp(prefix="ubg-")
+    url = None
     try:
         site_copy = Path(tmp) / "site"
         await asyncio.to_thread(shutil.copytree, SITE_DIR, site_copy, ignore=SITE_SKIP)
@@ -453,7 +857,7 @@ async def deploy_site() -> str:
             "--project-name", project, "--branch", "main", "--commit-dirty=true",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "WRANGLER_SEND_METRICS": "false"},  # token is read from env, not argv
+            env={**os.environ, "WRANGLER_SEND_METRICS": "false"},
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
@@ -466,18 +870,18 @@ async def deploy_site() -> str:
         match = PAGES_URL_RE.search(text)
         if not match:
             raise RuntimeError(f"no URL found in wrangler output: {text[-300:]}")
+        url = match.group(0)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     task = asyncio.create_task(cleanup_old_deployments())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
-    return match.group(0)
+    return url
 
 SURGE_BIN = BASE_DIR / "node_modules" / ".bin" / "surge"
 
 async def deploy_surge_site() -> str:
-    """Copies the site to a temp folder, deploys it to a fresh surge.sh subdomain, returns the URL."""
     token = os.environ.get("SURGE_TOKEN")
     if not token:
         raise RuntimeError("SURGE_TOKEN is not set")
@@ -492,7 +896,7 @@ async def deploy_surge_site() -> str:
         await asyncio.to_thread(shutil.copytree, SITE_DIR, site_copy, ignore=SITE_SKIP)
 
         proc = await asyncio.create_subprocess_exec(
-            surge, str(site_copy), domain,  # token is read from env, not argv
+            surge, str(site_copy), domain,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "SURGE_TOKEN": token, "SURGE_LOGIN": os.environ.get("SURGE_LOGIN", "")},
@@ -513,7 +917,6 @@ VERCEL_BIN = BASE_DIR / "node_modules" / ".bin" / "vercel"
 VERCEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.vercel\.app")
 
 async def deploy_vercel_site() -> str:
-    """Copies the site to a temp folder, deploys it to Vercel, returns the unique deployment URL."""
     token = os.environ.get("VERCEL_TOKEN")
     org_id = os.environ.get("VERCEL_ORG_ID")
     project_id = os.environ.get("VERCEL_PROJECT_ID")
@@ -524,12 +927,13 @@ async def deploy_vercel_site() -> str:
 
     vercel = str(VERCEL_BIN) if VERCEL_BIN.exists() else "vercel"
     tmp = tempfile.mkdtemp(prefix="ubg-")
+    url = None
     try:
         site_copy = Path(tmp) / "site"
         await asyncio.to_thread(shutil.copytree, SITE_DIR, site_copy, ignore=SITE_SKIP)
 
         proc = await asyncio.create_subprocess_exec(
-            vercel, "deploy", str(site_copy), "--yes",  # token and project come from env, not argv
+            vercel, "deploy", str(site_copy), "--yes",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "VERCEL_TOKEN": token, "VERCEL_ORG_ID": org_id, "VERCEL_PROJECT_ID": project_id},
@@ -543,14 +947,14 @@ async def deploy_vercel_site() -> str:
         err_text = err.decode(errors="ignore")
         if proc.returncode != 0:
             raise RuntimeError((err_text or out_text)[-400:])
-        # Vercel prints the deployment URL on stdout; fall back to stderr just in case
         match = VERCEL_URL_RE.search(out_text) or VERCEL_URL_RE.search(err_text)
         if not match:
             raise RuntimeError(f"no URL found in vercel output: {(out_text + err_text)[-300:]}")
+        url = match.group(0)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    return match.group(0)
+    return url
 
 HOSTS = {
     "cloudflare": ("☁️ Cloudflare", deploy_site),
@@ -559,8 +963,6 @@ HOSTS = {
 }
 
 async def generate_links(kinds: list[str], show_errors: bool = False) -> list[str]:
-    """Deploys to the chosen hosts in parallel. Returns one result line per host (link or failure note).
-    With show_errors=True the failure reason is included in the line (only used for private replies)."""
     results = await asyncio.gather(*(HOSTS[k][1]() for k in kinds), return_exceptions=True)
     lines = []
     for k, res in zip(kinds, results):
@@ -576,7 +978,6 @@ async def generate_links(kinds: list[str], show_errors: bool = False) -> list[st
             lines.append(f"{label}: {res}")
     return lines
 
-# --- Password gate: every command that creates a site asks for LINK_PASSWORD in a private pop-up ---
 LINK_PASSWORD = os.environ.get("LINK_PASSWORD", "")
 
 def password_ok(entered: str) -> bool:
@@ -613,7 +1014,6 @@ class PasswordModal(discord.ui.Modal):
 SLASH_ONLY_MSG = "🔒 Please use the slash command version, since it asks for the password privately."
 
 class LinkTypeView(View):
-    """Shown after the password is accepted: the user picks which kind of link to generate."""
     def __init__(self):
         super().__init__(timeout=120)
 
@@ -621,7 +1021,7 @@ class LinkTypeView(View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(content="⏳ Generating your link...", view=self)
-        lines = await generate_links(kinds, show_errors=True)  # private reply, safe to show details
+        lines = await generate_links(kinds, show_errors=True)
         await interaction.edit_original_response(content="\n".join(lines), view=None)
 
     @discord.ui.button(label="Cloudflare", emoji="☁️", style=discord.ButtonStyle.primary)
@@ -645,34 +1045,36 @@ async def makelink_after_password(interaction: discord.Interaction):
         "Which type of link do you want?", view=LinkTypeView(), ephemeral=True)
 
 @bot.hybrid_command(name="makelink", description="Generates a fresh Cloudflare, Surge and/or Vercel link (password required).")
+@commands.cooldown(1, 30, commands.BucketType.user)
 async def makelink(ctx: commands.Context):
-    if ctx.interaction is None:  # typed as !makelink: a password typed in chat would be public
+    if not LINK_PASSWORD:
+        await ctx.send("❌ No password is set on the bot (LINK_PASSWORD).", ephemeral=True)
+        return
+    if ctx.interaction is None:
         await ctx.send(SLASH_ONLY_MSG)
         return
     await ctx.interaction.response.send_modal(PasswordModal(makelink_after_password))
 
 # ==========================================
-# 9.6 AUTO LINK POSTER (/autolink)
+# 13. AUTO LINK POSTER (/autolink)
 # ==========================================
-AUTOLINK_INTERVAL_MIN = 60  # how often a new link is posted (minutes)
+AUTOLINK_INTERVAL_MIN = 60
 autolink_channel_id = int(os.environ.get("AUTOLINK_CHANNEL_ID", "0") or 0)
-# Which hosts the timer posts links for. Override with AUTOLINK_HOSTS=cloudflare,surge,vercel (any subset).
 AUTOLINK_HOSTS = [h.strip() for h in os.environ.get("AUTOLINK_HOSTS", "cloudflare,surge,vercel").split(",") if h.strip() in HOSTS] or list(HOSTS)
 
 @tasks.loop(minutes=AUTOLINK_INTERVAL_MIN)
 async def autolink_loop():
-    channel = bot.get_channel(autolink_channel_id)
-    if channel is None:
-        return
-    lines = await generate_links(AUTOLINK_HOSTS)
-    if all("❌ failed" in line for line in lines):
-        print("autolink: both deploys failed, nothing posted")
-        return
-
     try:
+        channel = bot.get_channel(autolink_channel_id)
+        if channel is None:
+            return
+        lines = await generate_links(AUTOLINK_HOSTS)
+        if all("❌ failed" in line for line in lines):
+            print("autolink: all deploys failed, nothing posted")
+            return
         await channel.send("🔗 **New links:**\n" + "\n".join(lines))
-    except discord.HTTPException as e:
-        print(f"autolink could not post: {e!r}")
+    except Exception as e:
+        print(f"autolink_loop error: {e!r}")
 
 @autolink_loop.before_loop
 async def before_autolink_loop():
@@ -688,8 +1090,11 @@ async def autolink(ctx: commands.Context):
 @autolink.command(name="start", description="Start posting a new link every 60 minutes in a channel.")
 @commands.has_permissions(administrator=True)
 async def autolink_start(ctx: commands.Context, channel: discord.TextChannel):
-    if ctx.interaction is None:  # typed as !autolink start: a password typed in chat would be public
+    if ctx.interaction is None:
         await ctx.send(SLASH_ONLY_MSG)
+        return
+    if not LINK_PASSWORD:
+        await ctx.send("❌ No password is set on the bot (LINK_PASSWORD).", ephemeral=True)
         return
 
     async def after_password(interaction: discord.Interaction):
@@ -711,11 +1116,10 @@ async def autolink_stop(ctx: commands.Context):
     await ctx.send("🛑 Auto link posting stopped.")
 
 # ==========================================
-# ERROR HANDLING (one global handler for every command)
+# 14. ERROR HANDLING
 # ==========================================
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    # Unwrap hybrid/invoke wrappers to get the real error
     while getattr(error, "original", None) is not None:
         error = error.original
 
@@ -723,12 +1127,16 @@ async def on_command_error(ctx: commands.Context, error):
         return
     if isinstance(error, commands.MissingPermissions):
         msg = "❌ You do not have permission to execute this command."
+    elif isinstance(error, commands.BotMissingPermissions):
+        msg = "❌ I'm missing the permissions required for that."
     elif isinstance(error, commands.NoPrivateMessage):
         msg = "❌ This command only works inside a server."
     elif isinstance(error, commands.CommandOnCooldown):
         msg = f"⏳ Try again in {error.retry_after:.0f}s."
     elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
         msg = "❌ Invalid or missing arguments. Check the command usage."
+    elif isinstance(error, commands.CheckFailure):
+        msg = "❌ You can't use that command here."
     elif isinstance(error, discord.Forbidden):
         msg = "❌ I don't have permission to do that (check my role and permissions)."
     else:
@@ -741,7 +1149,7 @@ async def on_command_error(ctx: commands.Context, error):
         pass
 
 # ==========================================
-# 10. RUN BOT
+# 15. RUN BOT
 # ==========================================
 token = os.environ.get("DISCORD_TOKEN")
 if token:
